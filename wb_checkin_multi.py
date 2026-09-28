@@ -34,6 +34,12 @@ Token 从哪来（一次性准备，之后长期独立运行）：
 
 退出码：全部账号成功/已签 0；存在失败 1；配置错误 2。
 
+v1.0.1（2026-09-28 事故后修订）：
+  - 领取接口返回 code=10001 / "已签到" 时**强制回查状态接口复核**：确属已签才算幂等成功；
+    若回查仍是未签到，判定为服务端「假已签到」（日边界竞态），按 30/60/120 秒间隔重试，
+    全部失败则报 status=error / action=rejected —— 不再像 v1.0.0 那样静默当成功。
+  - 状态/领取接口的原始 HTTP 码与响应体全部落盘到 logs/last_run.json 的 detail 字段。
+
 安全约定：
   - 任何输出（终端 / 日志 / 通知）都不包含完整 Token，一律脱敏。
   - accounts.json 是本工具唯一的凭据文件，含明文 Token，请勿外传 / 勿提交仓库。
@@ -61,7 +67,7 @@ if sys.version_info < (3, 6):
     sys.stderr.write("需要 Python 3.6+，当前 %s\n" % sys.version.split()[0])
     sys.exit(2)
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # ---------------- 路径与常量 ----------------
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -85,6 +91,8 @@ DEFAULT_DOMAINS = ["www.workbuddy.cn", "www.codebuddy.cn", "copilot.tencent.com"
 HTTP_TIMEOUT = 12
 MAX_RETRY = 2
 EXPIRY_WARN_DAYS = 7
+# 服务端"假已签到"（日边界竞态）时的复核重试间隔（秒）
+FALSE_ALREADY_DELAYS = (30, 60, 120)
 
 TRAVEL_STATE_TEXT = {"idle": "空闲(可派遣)", "traveling": "旅行中", "arrived": "已到达待领取"}
 
@@ -328,84 +336,165 @@ def extract_balance(*bodies):
 
 
 # ---------------- 签到 ----------------
+def _slim_status(body):
+    """状态响应瘦身：只留排查所需字段，避免日志膨胀。"""
+    if not isinstance(body, dict):
+        return body
+    out = {k: body[k] for k in ("code", "msg", "requestId") if k in body}
+    data = body.get("data")
+    if isinstance(data, dict):
+        keep = ("active", "today_checked_in", "streak_days", "total_credits",
+                "daily_credit", "today_credit", "checkin_dates")
+        out["data"] = {k: data[k] for k in keep if k in data}
+    return out
+
+
+def _probe_status(acc, base, res, tag=""):
+    """查一次状态，并把原始响应写进 res["detail"]。
+
+    返回 (网络是否成功, 响应体, today_signed)；网络失败返回 (False, None, None)。
+    """
+    try:
+        st_code, st_body = api_call(base, STATUS_PATH, acc["token"])
+    except Exception as e:  # noqa: BLE001
+        res["detail"]["status_http" + tag] = "EXC: %s" % e
+        return False, None, None
+    res["detail"]["status_http" + tag] = st_code
+    res["detail"]["status_body" + tag] = _slim_status(st_body)
+    today_signed = False
+    if isinstance(st_body, dict):
+        if st_body.get("today_checked_in") is True:
+            today_signed = True
+        elif isinstance(st_body.get("data"), dict) and st_body["data"].get("today_checked_in") is True:
+            today_signed = True
+        elif str(st_body.get("code")) == "10001":
+            today_signed = True
+    return True, st_body, today_signed
+
+
 def do_checkin(acc, base, check_only=False):
-    """单账号签到。返回结果片段。"""
+    """单账号签到。返回结果片段。
+
+    关键约定（2026-09-28 事故后修订，勿回退）：
+      1. 领取接口返回 code=10001 / 含"已签到"时**必须先回查状态接口复核**，不得直接当成功：
+           · 复核也是已签到 → 真幂等，action=already_signed；
+           · 复核显示仍未签到 → 服务端"假已签到"（日边界竞态），
+             按 FALSE_ALREADY_DELAYS 间隔重试；全部失败则 status=error / action=rejected，
+             绝不静默当成功（旧版正是因此漏签却不报警）。
+      2. 状态接口与领取接口的原始 HTTP 码、响应体全部写入 res["detail"]，
+         由 run_one 带进 logs/last_run.json，供事后定位。
+    """
     res = {"status": "error", "action": None, "points": None, "balance": None,
            "streak_days": None, "msg": "", "detail": {}}
-    last_err = None
+
+    # ---- 1. 状态查询（网络异常按 MAX_RETRY 重试）----
+    st_body, net_ok, today_signed = None, False, False
     for attempt in range(1, MAX_RETRY + 1):
-        try:
-            st_code, st_body = api_call(base, STATUS_PATH, acc["token"])
-            res["detail"]["status_http"] = st_code
-            res["balance"] = extract_balance(st_body)
-
-            if isinstance(st_body, dict) and "code" in st_body and str(st_body.get("code")) not in ("0", "10001"):
-                if st_code in (401, 403):
-                    res.update(status="error", action="token_invalid",
-                               msg="Token 已失效或被拒绝（HTTP %s），请用 --set-token 更新" % st_code)
-                    return res
-            today_signed = False
-            if isinstance(st_body, dict):
-                if st_body.get("today_checked_in") is True:
-                    today_signed = True
-                elif isinstance(st_body.get("data"), dict) and st_body["data"].get("today_checked_in") is True:
-                    today_signed = True
-                elif str(st_body.get("code")) == "10001":
-                    today_signed = True
-            if isinstance(st_body, dict) and isinstance(st_body.get("data"), dict):
-                res["streak_days"] = st_body["data"].get("streak_days")
-                if res["balance"] is None:
-                    res["balance"] = extract_balance(st_body["data"])
-
-            if check_only:
-                res.update(status="ok", action="check_only",
-                           msg="状态查询成功%s" % ("（今日已签）" if today_signed else "（今日未签）"))
-                res["detail"]["today_signed"] = today_signed
-                return res
-
-            if today_signed:
-                res.update(status="ok", action="already_signed", msg="今日已签到，跳过领取")
-                return res
-
-            ck_code, ck_body = api_call(base, CHECKIN_PATH, acc["token"])
-            res["detail"]["checkin_http"] = ck_code
-            if not isinstance(ck_body, dict):
-                res.update(status="error", action="failed", msg="领取接口返回非 JSON")
-                return res
-            code = str(ck_body.get("code", ""))
-            msg = ck_body.get("msg") or ck_body.get("message") or ""
-            data = ck_body.get("data") if isinstance(ck_body.get("data"), dict) else {}
-            if code == "10001" or "已签到" in msg:
-                res.update(status="ok", action="already_signed", msg="今日已签到（服务端幂等返回）")
-                return res
-            if 200 <= ck_code < 300 and code in ("", "0", "200"):
-                credit = (ck_body.get("credit") or data.get("credit")
-                          or data.get("daily_credit") or data.get("today_credit"))
-                streak = ck_body.get("streak_days") or data.get("streak_days")
-                bbal = extract_balance(ck_body)
-                if bbal is not None:
-                    res["balance"] = bbal
-                res.update(status="ok", action="signed", points=credit, streak_days=streak,
-                           msg="签到成功%s%s" % (("，+%s 积分" % credit) if credit else "",
-                                              ("，连续第 %s 天" % streak) if streak else ""))
-                return res
-            if ck_code in (401, 403):
-                res.update(status="error", action="token_invalid",
-                           msg="Token 已失效或被拒绝（HTTP %s），请用 --set-token 更新" % ck_code)
-                return res
-            res.update(status="error", action="failed",
-                       msg=msg or ("HTTP %s（业务码 %s）" % (ck_code, code)))
-            return res
-        except urllib.error.HTTPError as e:
-            last_err = "HTTP %s: %s" % (e.code, e.reason)
-        except urllib.error.URLError as e:
-            last_err = "网络错误: %s" % e.reason
-        except Exception as e:  # noqa: BLE001
-            last_err = "异常: %s" % e
+        net_ok, st_body, today_signed = _probe_status(acc, base, res)
+        if net_ok:
+            break
         if attempt < MAX_RETRY:
             time.sleep(1.5)
-    res.update(status="error", action="failed", msg="重试 %d 次后仍失败：%s" % (MAX_RETRY, last_err))
-    return res
+    if not net_ok:
+        res.update(status="error", action="failed",
+                   msg="状态查询重试 %d 次后仍失败：%s"
+                       % (MAX_RETRY, res["detail"].get("status_http")))
+        return res
+
+    st_code = res["detail"].get("status_http")
+    res["balance"] = extract_balance(st_body)
+    if (isinstance(st_body, dict) and "code" in st_body
+            and str(st_body.get("code")) not in ("0", "10001") and st_code in (401, 403)):
+        res.update(status="error", action="token_invalid",
+                   msg="Token 已失效或被拒绝（HTTP %s），请用 --set-token 更新" % st_code)
+        return res
+    if isinstance(st_body, dict) and isinstance(st_body.get("data"), dict):
+        res["streak_days"] = st_body["data"].get("streak_days")
+        if res["balance"] is None:
+            res["balance"] = extract_balance(st_body["data"])
+
+    if check_only:
+        res.update(status="ok", action="check_only",
+                   msg="状态查询成功%s" % ("（今日已签）" if today_signed else "（今日未签）"))
+        res["detail"]["today_signed"] = today_signed
+        return res
+
+    res["detail"]["today_signed"] = today_signed
+    if today_signed:
+        res.update(status="ok", action="already_signed", msg="今日已签到，跳过领取")
+        return res
+
+    # ---- 2. 领取 + 复核（含"假已签到"重试）----
+    tries = 0
+    while True:
+        suffix = "" if tries == 0 else "#%d" % tries
+        try:
+            ck_code, ck_body = api_call(base, CHECKIN_PATH, acc["token"])
+        except Exception as e:  # noqa: BLE001
+            res["detail"]["checkin_http" + suffix] = "EXC: %s" % e
+            if tries < len(FALSE_ALREADY_DELAYS):
+                time.sleep(FALSE_ALREADY_DELAYS[tries])
+                tries += 1
+                continue
+            res.update(status="error", action="failed",
+                       msg="领取请求异常且重试耗尽：%s" % e)
+            return res
+        res["detail"]["checkin_http" + suffix] = ck_code
+        res["detail"]["checkin_body" + suffix] = ck_body
+
+        if not isinstance(ck_body, dict):
+            res.update(status="error", action="failed",
+                       msg="领取接口返回非 JSON（原始响应已存 detail）")
+            return res
+        code = str(ck_body.get("code", ""))
+        msg = ck_body.get("msg") or ck_body.get("message") or ""
+        data = ck_body.get("data") if isinstance(ck_body.get("data"), dict) else {}
+
+        if code == "10001" or "已签到" in msg:
+            # ⚠️ 不当成功：先回查状态接口复核
+            v_ok, _v_body, v_today = _probe_status(acc, base, res, "_verify" + suffix)
+            if v_ok and v_today is True:
+                res.update(status="ok", action="already_signed",
+                           msg="今日已签到（服务端幂等返回，已回查状态确认）")
+                return res
+            tries += 1
+            res["detail"]["false_already_count"] = tries
+            if tries <= len(FALSE_ALREADY_DELAYS):
+                delay = FALSE_ALREADY_DELAYS[tries - 1]
+                res["detail"]["next_retry_delay_s"] = delay
+                time.sleep(delay)
+                continue
+            why = ("回查状态仍是未签到，判定为服务端「假已签到」"
+                   if (v_ok and v_today is False) else "回查状态接口失败，无法确认")
+            res.update(
+                status="error", action="rejected",
+                msg="领取被服务端拒绝 code=%s msg=「%s」；%s；已按 %s 秒间隔重试 %d 次仍失败 "
+                    "→ 今日【未能签到】，请手动补签"
+                    % (code, msg or "-", why,
+                       "/".join(str(x) for x in FALSE_ALREADY_DELAYS), len(FALSE_ALREADY_DELAYS)))
+            return res
+
+        if 200 <= ck_code < 300 and code in ("", "0", "200"):
+            credit = (ck_body.get("credit") or data.get("credit")
+                      or data.get("daily_credit") or data.get("today_credit"))
+            streak = ck_body.get("streak_days") or data.get("streak_days")
+            bbal = extract_balance(ck_body)
+            if bbal is not None:
+                res["balance"] = bbal
+            if tries:
+                res["detail"]["recovered_after_retries"] = tries
+            res.update(status="ok", action="signed", points=credit, streak_days=streak,
+                       msg="签到成功%s%s%s" % (("，+%s 积分" % credit) if credit else "",
+                                            ("，连续第 %s 天" % streak) if streak else "",
+                                            ("（第 %d 次重试才成功）" % (tries + 1)) if tries else ""))
+            return res
+        if ck_code in (401, 403):
+            res.update(status="error", action="token_invalid",
+                       msg="Token 已失效或被拒绝（HTTP %s），请用 --set-token 更新" % ck_code)
+            return res
+        res.update(status="error", action="failed",
+                   msg=msg or ("HTTP %s（业务码 %s）" % (ck_code, code)))
+        return res
 
 
 # ---------------- 派小猫旅行 ----------------
@@ -508,6 +597,7 @@ def run_one(acc, settings, do_check=True, check_only=False, travel_mode="auto", 
         "id": acc.get("id"), "label": acc.get("label"), "uid_masked": mask_id(acc.get("uid")),
         "status": "error", "action": None, "points": None, "balance": None, "streak_days": None,
         "domain": None, "token_masked": mask_token(acc.get("token")), "msg": "", "travel": None,
+        "detail": {},
     }
     token = clean_token(acc.get("token"))
     if not token:
@@ -530,7 +620,8 @@ def run_one(acc, settings, do_check=True, check_only=False, travel_mode="auto", 
     if do_check:
         ck = do_checkin(acc, base, check_only=check_only)
         res.update(status=ck["status"], action=ck["action"], points=ck["points"],
-                   balance=ck["balance"], streak_days=ck["streak_days"], msg=ck["msg"])
+                   balance=ck["balance"], streak_days=ck["streak_days"], msg=ck["msg"],
+                   detail=ck.get("detail") or {})
 
     if travel_mode != "off":
         tv = travel_auto(token, location_id, read_only=(travel_mode == "readonly"))
@@ -915,6 +1006,11 @@ def print_report(results, elapsed, do_check=True, check_only=False, travel_mode=
         print("%s [%s] %s" % (mark, r.get("id"), r.get("label")))
         if r["status"] != "ok":
             print("    结果：%s" % r["msg"])
+            d = r.get("detail") or {}
+            for k in sorted(x for x in d if x.startswith("checkin_body")):
+                tag = k[len("checkin_body"):] or "（首次）"
+                print("    服务端原始返回%s：%s"
+                      % (tag, json.dumps(d[k], ensure_ascii=False)[:300]))
             continue
         if do_check:
             line = "    签到：%s" % (r["msg"] or "").split(" ｜ ")[0]
@@ -923,7 +1019,7 @@ def print_report(results, elapsed, do_check=True, check_only=False, travel_mode=
             if r.get("balance") is not None:
                 line += " | 余额 %s" % r["balance"]
             if r.get("streak_days"):
-                line += " | 连续 %s 天" % r["streak_days"]
+                line += " | 已结算连签 %s 天" % r["streak_days"]
             print(line)
         tv = r.get("travel") or {}
         if tv:
@@ -983,7 +1079,7 @@ def write_logs(results):
             w = csv.writer(f)
             if new_file:
                 w.writerow(["时间", "账号ID", "账号名", "UID", "状态", "动作", "积分", "余额",
-                            "连续天数", "小猫状态", "小猫地点", "域名", "说明"])
+                            "已结算连签天数", "小猫状态", "小猫地点", "域名", "说明"])
             for r in results:
                 tv = r.get("travel") or {}
                 w.writerow([now_str(), r.get("id"), r.get("label"), r.get("uid_masked"),
