@@ -1,0 +1,221 @@
+# WorkBuddy 多账号自动签到工具（独立版）
+
+一次运行，把 **N 个账号**的「Buddy 加油站」每日签到 + **派小猫旅行**全部跑完。
+Token 存在工具自己的 `accounts.json` 里，**运行期不读取、不依赖 WorkBuddy 客户端**——客户端没开、没登录、登录态被本地加密，都不影响。
+
+> **从 GitHub 克隆后怎么开始**：仓库**不含** `accounts.json`（含明文 Token，已被 `.gitignore` 排除），首次运行会自动生成空配置。
+> 你只需要：① 在本机登录过要签到的账号 → ② 双击 `启动菜单.bat` → ③ 选 `6 → 1` 提取 Token → ④ 选 `1` 试跑一次 → ⑤ 选 `7 → 1` 装上每日定时任务。全程不用记命令。
+
+```
+wb-checkin-multi/
+├─ 启动菜单.bat            ★ 双击即用（交互式菜单，不用记任何命令）
+├─ wb_menu.py             菜单程序（CLI 向导）
+├─ wb_checkin_multi.py    主程序 / 命令行（纯 Python 标准库，零依赖，Python 3.6+）
+├─ install_task.ps1       Windows 计划任务安装/卸载（独立定时，不依赖 WorkBuddy）
+├─ accounts.json          账号与 Token（首次运行自动生成；含明文凭据，勿外传）
+├─ accounts.example.json  配置模板
+└─ logs/
+   ├─ checkin-YYYY-MM.csv  每日明细（按账号一行，可直接用 Excel 打开）
+   └─ last_run.json        最近一次运行的完整结果
+```
+
+---
+
+## 方式一：交互式菜单（推荐）
+
+**双击 `启动菜单.bat`** 即可，什么命令都不用记。也可以：
+
+```bash
+python wb_menu.py                    # 直接跑菜单
+python wb_checkin_multi.py --menu    # 同上，从主程序进
+```
+
+```
+══════════════════════════════════════════════════════════════════════════════
+  WorkBuddy 多账号签到助手 · 交互菜单   v1.0.0
+══════════════════════════════════════════════════════════════════════════════
+  账号 2 个（启用 2）  ｜  桌面通知 开  ｜  定时任务 已安装（下次 09/27/2026 09:00）
+  Token：全部正常
+══════════════════════════════════════════════════════════════════════════════
+  主菜单
+──────────────────────────────────────────────────────────────────────────────
+    1. 立即签到 + 派小猫（全部启用账号）
+    2. 只签到（不派小猫）
+    3. 只派小猫旅行
+    4. 只查询状态（只读，不领取）
+    5. 选择账号执行…
+    6. 账号管理…
+    7. 定时任务…（每日自动签到）
+    8. 查看账号与 Token 有效期
+    9. 查看最近一次运行结果 / 日志
+   10. 设置…（并发 / 桌面通知 / 派遣地点）
+   11. 环境自检
+   12. 使用帮助
+    0. 退出
+```
+
+菜单结构：
+
+| 分组 | 能做什么 |
+|---|---|
+| **1-4 立即执行** | 一键签到+派小猫 / 只签到 / 只派小猫 / 只查询状态 |
+| **5 选择账号执行** | 按编号挑选账号（如 `1,3`），再选执行模式 |
+| **6 账号管理** | 从本机登录态批量提取 Token、手工添加、更新 Token、启用/停用、删除、查看列表 |
+| **7 定时任务** | 安装/修改自动签到时间、卸载、查看状态、立即试跑 |
+| **8-9 查看** | 账号与 Token 有效期、最近一次运行结果与日志路径 |
+| **10 设置** | 并发线程数、桌面通知开关、某账号的固定派遣地点 |
+| **11-12** | 环境自检、使用要点 |
+
+菜单顶部常显三件事：账号数、桌面通知开关、定时任务下次执行时间；Token 快过期会变黄提醒。
+**菜单本身不做任何业务逻辑**，全部调用主程序里的同一批函数，不存在两套代码走偏。
+
+---
+
+## 方式二：命令行（适合脚本 / 定时任务）
+
+### 快速开始（3 步）
+
+```bash
+# 1) 提取本机 History 登录态里的 Token（一次性，只读，按账号自动归组）
+python wb_checkin_multi.py --capture
+
+# 2) 核对账号与 Token 有效期
+python wb_checkin_multi.py --list
+
+# 3) 全部账号签到 + 派小猫（并发执行）
+python wb_checkin_multi.py
+```
+
+安装每日 09:00 自动执行（**与 WorkBuddy 无关，系统级定时**）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install_task.ps1            # 默认 09:00
+powershell -ExecutionPolicy Bypass -File install_task.ps1 -Time 09:10
+powershell -ExecutionPolicy Bypass -File install_task.ps1 -Uninstall  # 卸载
+```
+
+> 计划任务跑的是**无参数模式**，不会弹出交互界面，与菜单互不干扰。
+
+---
+
+## 账号管理
+
+| 操作 | 命令 |
+|---|---|
+| 从本机登录态批量提取 | `--capture`（可选 `--capture-dir 目录`、`--label-prefix 公司`、`--keep-label`） |
+| 手工添加账号 | `--add --label 小号 --token <TOKEN> [--domain www.workbuddy.cn]`（省略 `--token` 则交互式粘贴） |
+| 更新既有账号 Token | `--set-token 小号 [--token <TOKEN>] [--domain ...]` |
+| 启用 / 停用账号 | `--enable 小号` / `--disable 小号` |
+| 删除账号 | `--remove 小号` |
+| 设置固定派遣地点 | `--set-location 小号 --set-location-value 3`（`random` 表示随机） |
+| 查看账号与有效期 | `--list` |
+| 桌面通知开关（持久化） | `--notify on` / `--notify off` |
+
+`--capture` 的取用规则（多账号场景的关键）：
+
+1. 扫描 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop*.info`（历史快照一并扫描）；
+2. 按顶层 `account.uid` **分组**——同一台机器上多个账号登录过，快照会交替属于不同账号，不分组就会把 A 的 Token 配到 B 名下；
+3. 每组取**未过期且最新**的一份明文 Token；
+4. 账号名优先用快照里的昵称，昵称被加密时回落到 `账号-<uin 后四位>`。
+
+> `--capture` 只读不写：修改的只有本工具的 `accounts.json`，登录态文件分毫不动。
+
+---
+
+## 运行模式
+
+| 场景 | 菜单 | 命令行 |
+|---|---|---|
+| 签到 + 派小猫 | `1` | `python wb_checkin_multi.py` |
+| 只签到，不派小猫 | `2` | `--no-travel` |
+| 只跑派小猫旅行 | `3` | `--travel-only` |
+| 只查状态（只读） | `4` | `--check-only` |
+| 指定账号 | `5` | `--accounts acc1,小号` |
+| 指定派遣地点（1-4） | `10 → 3` | `--location 3` |
+| 调并发（默认 4） | `10 → 1` | `--concurrency 6` |
+| 关桌面通知 | `10 → 2` | `--no-notify` |
+| 纯 JSON 输出 | — | `--json` |
+| 环境自检 | `11` | `--diagnose` |
+
+退出码：全部账号成功/已签 → `0`；有失败 → `1`；配置问题 → `2`。可直接被上层调度判断。
+
+---
+
+## 派小猫旅行（每个账号独立闭环）
+
+1. 查状态 `GET /activity/growth/buddy/travel/status`；
+2. `arrived`（已到达）→ `POST .../travel/claim` 领积分，再复查状态；
+3. `idle` 且**未达每日上限** → `POST .../travel/depart` 派出（随机地点，或指定）；
+4. `traveling` → 不派遣，只报到达倒计时；**已到达的奖励不会丢**，下次运行自动补领。
+
+硬规则：派遣前必查 `daily_limit_reached`，达上限**一个写请求都不发**。
+旅行接口域名固定 `www.workbuddy.cn` 且路径**不带 `/v2`**（用签到域名或加 `/v2` 一律 404）。
+
+---
+
+## 配置说明（`accounts.json`）
+
+```json
+{
+  "version": 1,
+  "settings": {
+    "domains": ["www.workbuddy.cn", "www.codebuddy.cn"],
+    "concurrency": 4,
+    "travel_default": true,
+    "desktop_notify": true
+  },
+  "accounts": [
+    {
+      "id": "acc1",
+      "label": "张三",
+      "uid": "…",
+      "token": "<accessToken>",
+      "domain": "www.workbuddy.cn",
+      "enabled": true,
+      "travel": true,
+      "location_id": null
+    }
+  ]
+}
+```
+
+- `domains`：候选域名，按顺序探测（本机实测 `www.workbuddy.cn` 可用；`copilot.tencent.com` 在旧版快照里作过日志域名）。
+- `enabled: false`：临时停用某账号（菜单 `6 → 4` 可切换，不删配置）。
+- `location_id`：该账号固定派遣地点；填 `null` 走随机。
+
+---
+
+## 排错速查
+
+| 现象 | 原因与处置 |
+|---|---|
+| `Token 已失效或被拒绝（HTTP 401/403）` | Token 过期。登录该账号的 WorkBuddy 客户端 → 菜单 `6 → 1`（或 `--capture`）重新提取 |
+| 菜单顶部显示 `Token：有 N 项需处理` | 有 Token 已过期或 7 天内到期，提前重新 capture 一次 |
+| `无法连接签到接口（所有候选域名均失败）` | 内网/代理/防火墙；用菜单 `11` 看 DNS 是否解析成功 |
+| `今日已签到，跳过领取` | 正常。服务端幂等，不会重复发积分 |
+| `今日派遣次数已用完，跳过派遣` | 正常的服务端每日限额，次日自动恢复 |
+| `arrived` 状态一直不领 | 不会丢积分，下次运行自动补领 |
+| 菜单里中文显示成乱码 | 用 `启动菜单.bat` 启动（它会切到 UTF-8 代码页）；不要在旧版 cmd 里直接跑 |
+| 菜单每次刷新都要等约 1 秒 | 首次查询计划任务状态会启动一次 PowerShell，结果缓存 20 秒，属正常 |
+| 计划任务没跑 | 任务在当前用户上下文注册，需用户已登录；菜单 `7 → 3` 看上次执行时间与结果 |
+
+---
+
+## 安全约定
+
+- `accounts.json` 含**明文 Token**，是本工具唯一的凭据文件：不要外传、不要提交到代码仓库、不要放进共享目录。
+- 所有输出（终端 / CSV / JSON / 桌面通知）中的 Token 一律脱敏为 `eyJhbGci...xxxx`。
+- 写操作仅限 3 个已验证端点：`daily-checkin`、`travel/claim`、`travel/depart`。
+- 使用范围：**仅限本人账号**。
+
+---
+
+## 已知限制
+
+- **Token 有效期约 30 天**，到期必须重新获取（本机实测 26 天左右）。这是接口鉴权的前提，无法绕过：
+  桌面端 5.6+ 已把 accessToken / refreshToken 以 AES-256-GCM 静态加密存储，密钥只在客户端进程内存里、不落盘，离线无法解密。
+  → 实用做法：每月登录一次客户端，跑一次 `--capture` 即可（工具会按账号自动择优更新）。
+- 计划任务在「用户已登录」时触发；配合 `-StartWhenAvailable`，错过的执行会补跑一次。
+- 旅行接口若被服务端下线，工具会静默降级，**不影响签到结论**。
+- 未实现自动续期（refreshToken 同样被静态加密，无法离线使用）。
+

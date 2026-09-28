@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "settings": {
+    "domains": ["www.workbuddy.cn", "www.codebuddy.cn"],
+    "concurrency": 4,
+    "travel_default": true,
+    "desktop_notify": true
+  },
+  "accounts": [
+    {
+      "id": "acc1",
+      "label": "主账号",
+      "uid": null,
+      "token": "在此填入 accessToken（或用 --capture / --add 自动写入）",
+      "domain": "www.workbuddy.cn",
+      "enabled": true,
+      "travel": true,
+      "location_id": null,
+      "source": "manual",
+      "updated_at": ""
+    },
+    {
+      "id": "acc2",
+      "label": "小号",
+      "uid": null,
+      "token": "",
+      "domain": "www.workbuddy.cn",
+      "enabled": true,
+      "travel": true,
+      "location_id": 3,
+      "source": "manual",
+      "updated_at": ""
+    }
+  ]
+}
