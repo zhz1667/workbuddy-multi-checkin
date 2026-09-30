@@ -144,7 +144,7 @@ def header():
         else:
             print("  Token：%s" % C.w("全部正常", C.GREEN))
     else:
-        print("  %s" % C.w("尚未配置账号 → 请选「6 → 1」从本机登录态提取", C.YELLOW))
+        print("  %s" % C.w("尚未配置账号 → 请选「7 → 1」从本机登录态提取", C.YELLOW))
     line("═")
 
 
@@ -152,7 +152,7 @@ def print_accounts():
     cfg = core.load_config()
     accounts = cfg["accounts"]
     if not accounts:
-        print(C.w("  还没有账号。请先选「6 → 1」从本机登录态提取，或「6 → 2」手工添加。", C.YELLOW))
+        print(C.w("  还没有账号。请先选「7 → 1」从本机登录态提取，或「7 → 2」手工添加。", C.YELLOW))
         return
     print("  %s %s %s %s %s %s"
           % (core.pad("编号", 6), core.pad("账号名", 16), core.pad("uid", 11),
@@ -180,7 +180,7 @@ def print_accounts():
 
 
 def run_and_show(check_only=False, do_check=True, travel_mode="auto",
-                 accounts=None, location_id=None, title="执行结果"):
+                 accounts=None, location_id=None, title="执行结果", activity_mode="auto"):
     cfg = core.load_config()
     accs = accounts if accounts is not None else core.select_accounts(cfg)
     if not accs:
@@ -191,21 +191,25 @@ def run_and_show(check_only=False, do_check=True, travel_mode="auto",
     print()
     core.execute_run(cfg, accs, do_check=do_check, check_only=check_only,
                      travel_mode=travel_mode, location_id=location_id,
-                     show_progress=True,
+                     show_progress=True, activity_mode=activity_mode,
                      notify=bool(cfg["settings"].get("desktop_notify", True)))
 
 
 # ---------------- 各菜单动作 ----------------
 def act_run_full():
-    run_and_show(title="签到 + 派小猫（全部启用账号）")
+    run_and_show(title="签到 + 派小猫 + 活跃自检（全部启用账号）")
 
 
 def act_run_checkin_only():
-    run_and_show(travel_mode="off", title="只签到（不派小猫）")
+    run_and_show(travel_mode="off", title="只签到（不派小猫，仍做活跃自检）")
 
 
 def act_run_travel_only():
     run_and_show(do_check=False, travel_mode="auto", title="只派小猫旅行")
+
+
+def act_run_activity_only():
+    run_and_show(do_check=False, travel_mode="off", title="只做活跃自检（连登中断预警，只读）")
 
 
 def act_run_status_only():
@@ -236,12 +240,14 @@ def act_run_selected():
         print(C.w("  没有匹配到账号。", C.YELLOW))
         return
     print(C.w("  已选：%s" % "，".join(a.get("label") for a in picked), C.GREEN))
-    mode = ask("  模式 1=签到+派小猫  2=只签到  3=只派小猫  4=只查询", "1")
-    table = {"1": (True, False, "auto", "签到 + 派小猫"),
+    mode = ask("  模式 1=签到+派小猫  2=只签到  3=只派小猫  4=只查询  5=只做活跃自检", "1")
+    table = {"1": (True, False, "auto", "签到 + 派小猫 + 活跃自检"),
              "2": (True, False, "off", "只签到"),
              "3": (False, False, "auto", "只派小猫"),
-             "4": (True, True, "readonly", "只查询状态")}
-    do_check, check_only, travel_mode, label = table.get(str(mode).strip(), table["1"])
+             "4": (True, True, "readonly", "只查询状态"),
+             "5": (False, False, "off", "只做活跃自检")}
+    picked_mode = table.get(str(mode).strip(), table["1"])
+    do_check, check_only, travel_mode, label = picked_mode
     run_and_show(check_only=check_only, do_check=do_check, travel_mode=travel_mode,
                  accounts=picked, title=label)
 
@@ -441,7 +447,7 @@ def act_task_status():
         return
     installed, info = task_state(force=True)
     if not installed:
-        print(C.w("  未安装定时任务。可在「7 → 1」安装。", C.YELLOW))
+        print(C.w("  未安装定时任务。可在「8 → 1」安装。", C.YELLOW))
         return
     print("  任务名    ：%s" % TASK_NAME)
     print("  状态      ：%s" % C.w(info.get("State", "-"), C.GREEN))
@@ -567,8 +573,9 @@ def act_help():
   %s
 
   · 首次使用：进「账号管理 → 从本机登录态提取」，一次性把本机登录过的账号全抓进来。
-  · 日常使用：直接用「1」一键签到 + 派小猫；想定时自动跑就装「7 → 1」定时任务。
-  · Token 有效期约 30 天，到期前一周菜单顶部会提示；届时登录一次客户端再「6 → 1」即可。
+  · 日常使用：直接用「1」一键签到 + 派小猫 + 活跃自检；想定时自动跑就装「8 → 1」定时任务。
+  · 只想看今天有没有点亮活跃（会不会断连登）：选「5」，全程只读。
+  · Token 有效期约 30 天，到期前一周菜单顶部会提示；届时登录一次客户端再「7 → 1」即可。
   · 计划任务与本菜单互不影响：任务跑的是无参数模式，不会弹出交互界面。
 
   %s
@@ -642,18 +649,19 @@ def main():
         ("3", "设置某账号的派遣地点", act_settings_location),
     ])
     items = [
-        ("1", "立即签到 + 派小猫（全部启用账号）", act_run_full),
+        ("1", "立即签到 + 派小猫 + 活跃自检（全部启用账号）", act_run_full),
         ("2", "只签到（不派小猫）", act_run_checkin_only),
         ("3", "只派小猫旅行", act_run_travel_only),
         ("4", "只查询状态（只读，不领取）", act_run_status_only),
-        ("5", "选择账号执行…", act_run_selected),
-        ("6", "账号管理…", sub_accounts),
-        ("7", "定时任务…（每日自动签到）", sub_task),
-        ("8", "查看账号与 Token 有效期", lambda: print_accounts()),
-        ("9", "查看最近一次运行结果 / 日志", act_last_result),
-        ("10", "设置…（并发 / 桌面通知 / 派遣地点）", sub_settings),
-        ("11", "环境自检", act_diagnose),
-        ("12", "使用帮助", act_help),
+        ("5", "只做活跃自检（连登中断预警，只读）", act_run_activity_only),
+        ("6", "选择账号执行…", act_run_selected),
+        ("7", "账号管理…", sub_accounts),
+        ("8", "定时任务…（每日自动签到）", sub_task),
+        ("9", "查看账号与 Token 有效期", lambda: print_accounts()),
+        ("10", "查看最近一次运行结果 / 日志", act_last_result),
+        ("11", "设置…（并发 / 桌面通知 / 派遣地点）", sub_settings),
+        ("12", "环境自检", act_diagnose),
+        ("13", "使用帮助", act_help),
     ]
     menu("主菜单", items, back_key="0", back_label="退出")
     print(C.w("\n  已退出。\n", C.DIM))

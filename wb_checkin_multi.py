@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WorkBuddy 多账号自动签到工具（独立版 v1.0.0）
+WorkBuddy 多账号自动签到工具（独立版 v1.0.2）
 
 设计目标（与官方 Skill 版的核心差异）：
   1. **多账号**：一个配置文件管 N 个账号，一次运行全部签到；并发执行（默认 4 线程）。
@@ -9,6 +9,8 @@ WorkBuddy 多账号自动签到工具（独立版 v1.0.0）
   3. **不依赖 WorkBuddy 登录态**：Token 存在本工具自己的 accounts.json 里，
      运行期完全不读取、不依赖 WorkBuddy 客户端；客户端退出 / 未登录 / 登录态
      被本地加密，都不影响本工具。可由 Windows 计划任务独立触发。
+  4. **活跃自检**：只读「活跃地图 / 连登」接口，判断当天有没有点亮活跃。
+     注意——**它只做检测和提醒，绝不代发对话**（见下方 v1.0.2 说明）。
 
 Token 从哪来（一次性准备，之后长期独立运行）：
   - `--capture`  从本机 WorkBuddy 历史登录态文件中**只读**提取明文 Token，
@@ -19,10 +21,12 @@ Token 从哪来（一次性准备，之后长期独立运行）：
 
 用法：
   python wb_checkin_multi.py --menu              # 交互式菜单（推荐，也可双击 启动菜单.bat）
-  python wb_checkin_multi.py                 # 所有启用账号：签到 + 派猫猫旅行（并发）
+  python wb_checkin_multi.py                 # 所有启用账号：签到 + 派猫猫旅行 + 活跃自检（并发）
   python wb_checkin_multi.py --check-only    # 只查状态，不领取（只读）
   python wb_checkin_multi.py --no-travel     # 只签到，不派小猫
   python wb_checkin_multi.py --travel-only   # 只跑派猫猫旅行
+  python wb_checkin_multi.py --activity-only # 只做活跃自检（连登中断预警）
+  python wb_checkin_multi.py --no-activity   # 跳过活跃自检
   python wb_checkin_multi.py --location 3    # 指定派遣地点（1-4，缺省随机）
   python wb_checkin_multi.py --accounts a1,a2  # 只跑指定账号
   python wb_checkin_multi.py --capture       # 从本机历史登录态提取 Token 到配置
@@ -34,6 +38,21 @@ Token 从哪来（一次性准备，之后长期独立运行）：
 
 退出码：全部账号成功/已签 0；存在失败 1；配置错误 2。
 
+v1.0.2（2026-09-30）—— 新增活跃自检（连登预警）：
+  - 「签到」与「连登」是**两套独立机制**：
+      · 签到（/v2/billing/meter/daily-checkin）→ 发 Credits，本工具已覆盖；
+      · 连登（/v2/activity/growth/streak）= **活跃地图的连续活跃天数**，口径为
+        「当天需完成一次有效对话」，数据每日 02:00 聚合，**与签到无关**。
+    所以只签到并不能保住连登：某天完全没用 WorkBuddy，连登就会断。
+  - 新增只读自检：GET /v2/activity/growth/heatmap 取 data.today.{score,is_active}，
+    GET /v2/activity/growth/streak 取连登天数与补登卡余额，逐账号打印并写入日志/CSV；
+    当天未点亮时在报告与桌面通知里显著提示「请手动发一条消息」。
+  - **刻意不做的事**：不代发对话、不调用模型接口。活动条款明令
+    「严禁采用刷量、多账号套利、篡改数据等作弊行为」「非正常使用路径触发风控，
+    平台有权取消领取资格并回收奖励」，故本工具在活跃维度只做「检测 + 提醒」。
+  - CSV 新增列：今日活跃 / 活跃分 / 连登天数（列定义按文件首行表头自适应，
+    历史月份的旧表头文件不受影响）。
+
 v1.0.1（2026-09-28 事故后修订）：
   - 领取接口返回 code=10001 / "已签到" 时**强制回查状态接口复核**：确属已签才算幂等成功；
     若回查仍是未签到，判定为服务端「假已签到」（日边界竞态），按 30/60/120 秒间隔重试，
@@ -44,6 +63,7 @@ v1.0.1（2026-09-28 事故后修订）：
   - 任何输出（终端 / 日志 / 通知）都不包含完整 Token，一律脱敏。
   - accounts.json 是本工具唯一的凭据文件，含明文 Token，请勿外传 / 勿提交仓库。
   - 写操作仅限 3 个已验证端点：daily-checkin、travel/claim、travel/depart。
+    活跃自检全程只读（GET）。
 """
 
 import argparse
@@ -67,7 +87,7 @@ if sys.version_info < (3, 6):
     sys.stderr.write("需要 Python 3.6+，当前 %s\n" % sys.version.split()[0])
     sys.exit(2)
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # ---------------- 路径与常量 ----------------
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -84,6 +104,15 @@ TRAVEL_STATUS_PATH = "/activity/growth/buddy/travel/status"
 TRAVEL_CONFIG_PATH = "/activity/growth/buddy/travel/config"
 TRAVEL_CLAIM_PATH = "/activity/growth/buddy/travel/claim"
 TRAVEL_DEPART_PATH = "/activity/growth/buddy/travel/depart"
+
+# 成长计划（活跃地图 / 连登）接口：域名固定 www.workbuddy.cn，**必须带 /v2** 前缀
+# （实测 /activity/growth/... 去掉 /v2 会落到另一套旧服务，返回完全不同的字段）
+GROWTH_BASE = "https://www.workbuddy.cn/v2"
+GROWTH_HEATMAP_PATH = "/activity/growth/heatmap"
+GROWTH_STREAK_PATH = "/activity/growth/streak"
+
+# 活跃分分档（前端配色函数：score<=0 无记录；<=10 / <=30 / <=60 / >60 共 4 档）
+ACTIVITY_SCORE_BANDS = ((0, "未点亮"), (10, "微亮"), (30, "常亮"), (60, "高亮"), (None, "炽热"))
 
 # 域名候选：配置里的 domain 优先，失败时按此顺序回退（实测三个都曾作为 auth.domain 出现）
 DEFAULT_DOMAINS = ["www.workbuddy.cn", "www.codebuddy.cn", "copilot.tencent.com"]
@@ -586,18 +615,100 @@ def travel_auto(token, location_id=None, read_only=False):
     return out
 
 
+# ---------------- 活跃自检（只读，连登预警） ----------------
+def _score_band(score):
+    """活跃分 → 档位名（对齐前端 va() 的 5 档配色）。"""
+    try:
+        score = float(score or 0)
+    except (TypeError, ValueError):
+        score = 0
+    for hi, name in ACTIVITY_SCORE_BANDS:
+        if hi is None or score <= hi:
+            return name
+    return ACTIVITY_SCORE_BANDS[-1][1]
+
+
+def growth_get(token, path):
+    """只读 GET 成长计划接口；成功返回 data 字典，否则 None。"""
+    try:
+        st, body = api_call(GROWTH_BASE, path, token, method="GET")
+    except Exception:  # noqa: BLE001
+        return None
+    if st == 200 and isinstance(body, dict) and str(body.get("code")) == "0":
+        data = body.get("data")
+        return data if isinstance(data, dict) else None
+    return None
+
+
+def check_activity(token):
+    """只读活跃自检：活跃地图 + 连登。
+
+    口径（来自成长计划页内置文案，勿臆测）：
+      · 「活跃口径：需完成一次有效对话才能被记录至活跃地图。」
+      · 活跃地图数据「每日 02:00」聚合；当天 score>0 即 is_active。
+      · 连登（streak）就是活跃地图的连续活跃天数，与签到无关。
+
+    **只读**：不代发对话、不调用任何模型接口。返回结果片段，供报告/日志使用。
+    """
+    out = {"ok": False, "today": None, "score": None, "active": None, "band": "",
+           "status_text": "", "updated_at": "", "streak_days": None,
+           "next_tier": "", "makeup_cards": None, "msg": "", "detail": {}}
+
+    hm = growth_get(token, GROWTH_HEATMAP_PATH)
+    if hm is None:
+        out["msg"] = "活跃地图接口不可用（Token 失效或网络异常）"
+        return out
+
+    today = hm.get("today") if isinstance(hm.get("today"), dict) else {}
+    out["today"] = today.get("date")
+    out["score"] = today.get("score")
+    active = today.get("is_active")
+    if active is None and out["score"] is not None:
+        active = (out["score"] or 0) > 0          # is_active 缺失时按 score>0 兜底
+    out["active"] = bool(active)
+    out["status_text"] = today.get("status_text") or ""
+    out["updated_at"] = hm.get("updated_at") or ""
+    out["band"] = _score_band(out["score"])
+    out["detail"]["heatmap"] = {
+        "today": today,
+        "range": hm.get("range"),
+        "updated_at": hm.get("updated_at"),
+        "cells_total": len(hm.get("cells") or []),
+    }
+
+    sk_data = growth_get(token, GROWTH_STREAK_PATH)
+    if isinstance(sk_data, dict):
+        out["detail"]["streak"] = sk_data
+        sk = sk_data.get("streak") if isinstance(sk_data.get("streak"), dict) else {}
+        out["streak_days"] = sk.get("days")
+        out["next_tier"] = sk.get("next_tier") or ""
+        out["makeup_cards"] = sk_data.get("makeup_cards")
+
+    out["ok"] = True
+    bits = ["今日已点亮（活跃分 %s · %s）" % (out["score"], out["band"]) if out["active"]
+            else "今日【未点亮】— 需完成一次有效对话才会被记录"]
+    if out["streak_days"] is not None:
+        bits.append("连登 %s 天" % out["streak_days"])
+    if out["next_tier"]:
+        bits.append("下一档 %s" % out["next_tier"])
+    out["msg"] = "活跃：" + "，".join(bits)
+    return out
+
+
 # ---------------- 单账号全流程 ----------------
-def run_one(acc, settings, do_check=True, check_only=False, travel_mode="auto", location_id=None):
+def run_one(acc, settings, do_check=True, check_only=False, travel_mode="auto",
+            location_id=None, activity_mode="auto"):
     """单账号全流程。
 
     do_check：是否执行签到；check_only：签到只读；travel_mode: auto/readonly/off
+    activity_mode: auto/off —— 只读活跃自检（连登预警），永不代发对话
     """
     started = time.time()
     res = {
         "id": acc.get("id"), "label": acc.get("label"), "uid_masked": mask_id(acc.get("uid")),
         "status": "error", "action": None, "points": None, "balance": None, "streak_days": None,
         "domain": None, "token_masked": mask_token(acc.get("token")), "msg": "", "travel": None,
-        "detail": {},
+        "activity": None, "detail": {},
     }
     token = clean_token(acc.get("token"))
     if not token:
@@ -644,6 +755,19 @@ def run_one(acc, settings, do_check=True, check_only=False, travel_mode="auto", 
             res["action"] = "travel"
             if not tv.get("available"):
                 res["msg"] = "查询旅行状态失败（Token 失效或网络异常）"
+
+    if activity_mode != "off":
+        ac = check_activity(token)
+        res["activity"] = ac
+        # 活跃自检失败不影响签到结论，但要在 msg 里留痕
+        if ac.get("msg"):
+            res["msg"] = (res["msg"] + " ｜ " + ac["msg"]) if res["msg"] else ac["msg"]
+        if not do_check and travel_mode == "off":
+            # 纯活跃自检模式：整体状态由活跃接口可用性决定
+            res["status"] = "ok" if ac.get("ok") else "error"
+            res["action"] = "activity"
+            if not ac.get("ok"):
+                res["msg"] = ac.get("msg") or "活跃自检失败"
 
     res["elapsed_ms"] = int((time.time() - started) * 1000)
     return res
@@ -919,7 +1043,7 @@ def cmd_notify(args):
 
 def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="auto",
                 location_id=None, workers=None, notify=None, as_json=False,
-                show_progress=True):
+                show_progress=True, activity_mode="auto"):
     """跑完一批账号，负责并发、日志、报表与通知。
 
     返回 (results, elapsed, exit_code)。
@@ -936,16 +1060,27 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
         notify = bool(settings.get("desktop_notify", True))
 
     if show_progress and not as_json:
-        print("开始处理 %d 个账号（并发 %d，模式：%s%s）…"
-              % (len(accounts), workers,
-                 "只查询" if check_only else ("只派小猫" if not do_check else "签到+派小猫"),
-                 "" if travel_mode == "auto" else "（旅行只读）"))
+        if not do_check and travel_mode == "off":
+            mode_bits = ["只做活跃自检"]
+        elif not do_check:
+            mode_bits = ["只派小猫"]
+        elif check_only:
+            mode_bits = ["只查询"]
+        else:
+            mode_bits = ["签到+派小猫"]
+        if activity_mode != "off" and (do_check or travel_mode != "off"):
+            mode_bits.append("活跃自检")
+        if travel_mode == "readonly" and do_check:
+            mode_bits.append("旅行只读")
+        print("开始处理 %d 个账号（并发 %d，模式：%s）…"
+              % (len(accounts), workers, " + ".join(mode_bits)))
 
     started = time.time()
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {pool.submit(run_one, acc, settings, do_check, check_only, travel_mode,
-                            location_id if location_id else acc.get("location_id")): acc
+                            location_id if location_id else acc.get("location_id"),
+                            activity_mode): acc
                 for acc in accounts}
         for fut in concurrent.futures.as_completed(futs):
             acc = futs[fut]
@@ -971,16 +1106,33 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
         print_report(results, elapsed, do_check, check_only, travel_mode)
         print("日志：%s" % LOG_DIR)
 
+    # 连登风险：有账号当天未点亮活跃（即便签到成功，连登仍有断档风险）
+    risk = [r for r in results
+            if isinstance(r.get("activity"), dict) and r["activity"].get("ok")
+            and not r["activity"].get("active")]
+
     if notify:
         ok = [r for r in results if r["status"] == "ok"]
         bad = [r for r in results if r["status"] != "ok"]
         signed = [r for r in results if r["action"] == "signed"]
         pts = sum(r["points"] or 0 for r in signed)
-        title = "WorkBuddy 签到：%d/%d 成功" % (len(ok), len(results))
+        if risk:
+            title = "WorkBuddy 活跃预警：%d 个账号今日未点亮" % len(risk)
+        elif do_check:
+            title = "WorkBuddy 签到：%d/%d 成功" % (len(ok), len(results))
+        else:
+            title = "WorkBuddy 自检：%d/%d 成功" % (len(ok), len(results))
         if do_check:
             body = ("新签 %d 个账号 +%s 积分" % (len(signed), pts)) if signed else "今日均已签到"
         else:
             body = "小猫旅行已处理 %d 个账号" % len(ok)
+        if activity_mode != "off" and not risk:
+            lit = [r for r in results if isinstance(r.get("activity"), dict)
+                   and r["activity"].get("ok") and r["activity"].get("active")]
+            body += " ｜ 活跃 %d/%d" % (len(lit), len(results))
+        if risk:
+            body += " ｜ 请手动发一条消息保住连登：%s" % "，".join(
+                str(r.get("label")) for r in risk)
         if bad:
             body += " ｜ 失败 %d：%s" % (len(bad), "，".join(str(b.get("label")) for b in bad))
         desktop_toast(title, body)
@@ -1004,6 +1156,17 @@ def print_report(results, elapsed, do_check=True, check_only=False, travel_mode=
     for r in results:
         mark = "✓" if r["status"] == "ok" else "✗"
         print("%s [%s] %s" % (mark, r.get("id"), r.get("label")))
+        ac = r.get("activity") if isinstance(r.get("activity"), dict) else None
+        if ac:
+            if not ac.get("ok"):
+                print("    活跃：自检失败 — %s" % ac.get("msg"))
+            else:
+                print("    活跃：%s ｜ 活跃分 %s（%s）｜ 连登 %s 天%s"
+                      % ("已点亮" if ac.get("active") else "**未点亮**",
+                         ac.get("score"), ac.get("band"), ac.get("streak_days"),
+                         " ｜ 更新于 %s" % ac["updated_at"] if ac.get("updated_at") else ""))
+                if not ac.get("active"):
+                    print("          ⚠ 连登有断档风险：请在 WorkBuddy 里手动发一条消息")
         if r["status"] != "ok":
             print("    结果：%s" % r["msg"])
             d = r.get("detail") or {}
@@ -1036,8 +1199,31 @@ def print_report(results, elapsed, do_check=True, check_only=False, travel_mode=
               % (r.get("token_masked"), r.get("domain") or "-", r.get("elapsed_ms")))
 
     print("-" * 92)
-    print("汇总：成功 %d / 失败 %d ｜ 本次新签 %d 个账号(+%s 积分) ｜ 今日已签 %d"
-          % (len(ok), len(bad), len(signed), total_points, len(skipped)))
+    if not do_check and travel_mode == "off":
+        print("汇总：成功 %d / 失败 %d ｜ 模式：只做活跃自检（全程只读，未发起任何写请求）"
+              % (len(ok), len(bad)))
+    else:
+        print("汇总：成功 %d / 失败 %d ｜ 本次新签 %d 个账号(+%s 积分) ｜ 今日已签 %d"
+              % (len(ok), len(bad), len(signed), total_points, len(skipped)))
+
+    acts = [r["activity"] for r in results
+            if isinstance(r.get("activity"), dict) and r["activity"].get("ok")]
+    if acts:
+        lit = [a for a in acts if a.get("active")]
+        print("活跃：%d/%d 个账号今日已点亮活跃地图 ｜ 连登：%s"
+              % (len(lit), len(acts),
+                 "，".join("%s %s 天" % (r.get("label"), r["activity"].get("streak_days"))
+                           for r in results
+                           if isinstance(r.get("activity"), dict)
+                           and r["activity"].get("ok")
+                           and r["activity"].get("streak_days") is not None) or "-"))
+        miss = [r for r in results
+                if isinstance(r.get("activity"), dict) and r["activity"].get("ok")
+                and not r["activity"].get("active")]
+        if miss:
+            print("⚠ 连登预警：以下账号今日未活跃（连登会断档）——%s"
+                  % "，".join(str(r.get("label")) for r in miss))
+            print("  处理方式：打开 WorkBuddy 任意对话，发一条消息即可点亮（本工具只提醒，不代发）。")
     if bad:
         print("失败账号：%s" % "，".join("%s(%s)" % (b.get("label"), str(b.get("msg"))[:40]) for b in bad))
     print("=" * 92)
@@ -1069,23 +1255,55 @@ def desktop_toast(title, body):
         pass
 
 
+def _read_csv_header(path):
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            return next(csv.reader(f), None) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def write_logs(results):
-    """追加 CSV 明细 + 覆写 last_run.json（均不含完整 Token）。"""
+    """追加 CSV 明细 + 覆写 last_run.json（均不含完整 Token）。
+
+    CSV 列按**文件首行表头自适应**：v1.0.2 新增的「今日活跃/活跃分/连登天数」只写进
+    新创建的文件（下个月自然生效）；已存在的旧表头文件仍按原列写，不会串列。
+    """
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         csv_path = os.path.join(LOG_DIR, "checkin-%s.csv" % datetime.now().strftime("%Y-%m"))
-        new_file = not os.path.isfile(csv_path)
+        wanted = ["时间", "账号ID", "账号名", "UID", "状态", "动作", "积分", "余额",
+                  "已结算连签天数", "今日活跃", "活跃分", "连登天数",
+                  "小猫状态", "小猫地点", "域名", "说明"]
+        if os.path.isfile(csv_path):
+            header = _read_csv_header(csv_path) or wanted
+            new_file = False
+        else:
+            header = wanted
+            new_file = True
+
+        def row_of(r):
+            tv = r.get("travel") or {}
+            ac = r.get("activity") if isinstance(r.get("activity"), dict) else {}
+            cell = {
+                "时间": now_str(), "账号ID": r.get("id"), "账号名": r.get("label"),
+                "UID": r.get("uid_masked"), "状态": r.get("status"), "动作": r.get("action"),
+                "积分": r.get("points"), "余额": r.get("balance"),
+                "已结算连签天数": r.get("streak_days"),
+                "今日活跃": ("是" if ac.get("active") else "否") if ac.get("ok") else "",
+                "活跃分": ac.get("score") if ac.get("ok") else "",
+                "连登天数": ac.get("streak_days") if ac.get("ok") else "",
+                "小猫状态": tv.get("state_text"), "小猫地点": tv.get("location_name"),
+                "域名": r.get("domain"), "说明": r.get("msg"),
+            }
+            return [cell.get(h, "") for h in header]
+
         with open(csv_path, "a", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
             if new_file:
-                w.writerow(["时间", "账号ID", "账号名", "UID", "状态", "动作", "积分", "余额",
-                            "已结算连签天数", "小猫状态", "小猫地点", "域名", "说明"])
+                w.writerow(header)
             for r in results:
-                tv = r.get("travel") or {}
-                w.writerow([now_str(), r.get("id"), r.get("label"), r.get("uid_masked"),
-                            r.get("status"), r.get("action"), r.get("points"), r.get("balance"),
-                            r.get("streak_days"), tv.get("state_text"), tv.get("location_name"),
-                            r.get("domain"), r.get("msg")])
+                w.writerow(row_of(r))
         with open(os.path.join(LOG_DIR, "last_run.json"), "w", encoding="utf-8") as f:
             json.dump({"time": now_str(), "results": results}, f, ensure_ascii=False, indent=2)
     except Exception:  # noqa: BLE001
@@ -1177,6 +1395,9 @@ def build_parser():
     p.add_argument("--check-only", action="store_true", help="只查状态，不领取（只读）")
     p.add_argument("--no-travel", action="store_true", help="只签到，不派小猫")
     p.add_argument("--travel-only", action="store_true", help="只跑派小猫旅行")
+    p.add_argument("--activity-only", action="store_true",
+                   help="只做活跃自检（读活跃地图/连登，连登中断预警；全程只读）")
+    p.add_argument("--no-activity", action="store_true", help="跳过活跃自检")
     p.add_argument("--location", type=int, choices=[1, 2, 3, 4], help="派遣地点（1-4，缺省随机）")
     p.add_argument("--accounts", help="只跑指定账号，逗号分隔 id 或 label")
     p.add_argument("--concurrency", type=int, help="并发线程数（默认取配置，建议 3-6）")
@@ -1221,7 +1442,11 @@ def main():
               % os.path.basename(__file__))
         return 2
 
-    if args.travel_only:
+    if args.activity_only:
+        do_check = False
+        check_only = bool(args.check_only)
+        travel_mode = "off"
+    elif args.travel_only:
         do_check = False
         check_only = bool(args.check_only)
         travel_mode = "readonly" if args.check_only else "auto"
@@ -1230,10 +1455,13 @@ def main():
         check_only = bool(args.check_only)
         travel_mode = "off" if args.no_travel else ("readonly" if args.check_only else "auto")
 
+    activity_mode = "off" if args.no_activity else "auto"
+
     _, _, code = execute_run(
         cfg, accounts, do_check=do_check, check_only=check_only,
         travel_mode=travel_mode, location_id=args.location,
-        workers=args.concurrency, notify=(not args.no_notify), as_json=args.json)
+        workers=args.concurrency, notify=(not args.no_notify), as_json=args.json,
+        activity_mode=activity_mode)
     return code
 
 
