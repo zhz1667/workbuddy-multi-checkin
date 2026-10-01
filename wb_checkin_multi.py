@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WorkBuddy 多账号自动签到工具（独立版 v1.0.2）
+WorkBuddy 多账号自动签到工具（独立版 v1.0.3）
 
 设计目标（与官方 Skill 版的核心差异）：
   1. **多账号**：一个配置文件管 N 个账号，一次运行全部签到；并发执行（默认 4 线程）。
@@ -10,7 +10,10 @@ WorkBuddy 多账号自动签到工具（独立版 v1.0.2）
      运行期完全不读取、不依赖 WorkBuddy 客户端；客户端退出 / 未登录 / 登录态
      被本地加密，都不影响本工具。可由 Windows 计划任务独立触发。
   4. **活跃自检**：只读「活跃地图 / 连登」接口，判断当天有没有点亮活跃。
-     注意——**它只做检测和提醒，绝不代发对话**（见下方 v1.0.2 说明）。
+  5. **每日问候（可选，默认开启）**：每天在 **03:00–08:00 之间随机一个时刻**，用
+     `hy3` 模型为每个账号发一条**随机语言**的问候（汉语/英语/俄语/法语/意大利语/德语），
+     用于把活跃地图点亮、维持连登。窗口内没赶上时按配置**补发**（见 v1.0.3 说明）。
+     **这是本工具唯一会主动发起对话的功能**，用 `--no-greet` 可完全关闭。
 
 Token 从哪来（一次性准备，之后长期独立运行）：
   - `--capture`  从本机 WorkBuddy 历史登录态文件中**只读**提取明文 Token，
@@ -27,6 +30,11 @@ Token 从哪来（一次性准备，之后长期独立运行）：
   python wb_checkin_multi.py --travel-only   # 只跑派猫猫旅行
   python wb_checkin_multi.py --activity-only # 只做活跃自检（连登中断预警）
   python wb_checkin_multi.py --no-activity   # 跳过活跃自检
+  python wb_checkin_multi.py --greet-only    # 只发每日问候（不看签到/小猫）
+  python wb_checkin_multi.py --no-greet      # 跳过每日问候（纯签到，不发起对话）
+  python wb_checkin_multi.py --greet         # 立即强制发一条问候（忽略窗口与当天已发）
+  python wb_checkin_multi.py --greet-status  # 查看今天问候的调度与发送情况
+  python wb_checkin_multi.py --greet-window  # 计划任务入口：轮询判断是否到点该发
   python wb_checkin_multi.py --location 3    # 指定派遣地点（1-4，缺省随机）
   python wb_checkin_multi.py --accounts a1,a2  # 只跑指定账号
   python wb_checkin_multi.py --capture       # 从本机历史登录态提取 Token 到配置
@@ -38,6 +46,26 @@ Token 从哪来（一次性准备，之后长期独立运行）：
 
 退出码：全部账号成功/已签 0；存在失败 1；配置错误 2。
 
+v1.0.3（2026-10-01）—— 新增每日问候（可关闭）：
+  - **为什么需要**：连登 = 活跃地图的连续活跃天数，口径是「当天完成一次有效对话」。
+    只签到保不住连登，所以增加「每天发一条问候」来点亮活跃。
+  - **怎么做**：POST https://<domain>/v2/chat/completions，body 形如
+    {"model":"hy3","messages":[{"role":"user","content":"<问候语>"}],"stream":true}。
+    **必须 stream=true** —— 服务端对非流式请求直接回 400（code 11101
+    "Non-stream chat request is currently not supported"），与鉴权无关。
+    请求头只需 Authorization: Bearer <token> + Content-Type + Accept: text/event-stream。
+  - **随机问候**：六种语言（汉语/英语/俄语/法语/意大利语/德语）各有若干条候选，
+    每次随机选「语言 × 句子」，并记录历史尽量避免与最近重复。
+  - **随机时间**：每天在 03:00–08:00 内随机取一个时刻（持久化到 logs/greet_state.json，
+    当天固定不变）；由计划任务每 15 分钟轮询一次，到点即发。
+  - **错过补发**：本机实测常在 08:14–10:04 才开机，纯窗口内调度会整日错过。
+    故窗口过后若当天仍未发送，会在下一次运行时（如 09:00 的签到任务）补发，
+    并在报告/CSV 中标注「补发」。用 --no-greet-catchup 可关掉补发、严格只走窗口。
+  - **幂等**：当天已成功发送的账号不会重复发送；失败会在后续轮询中重试（最多 3 次）。
+  - **⚠️ 风控提示**：平台活动条款写明「严禁采用刷量、多账号套利…」「非正常使用路径
+    触发风控，平台有权取消领取资格并回收奖励」。本功能属于**自动化发起对话**，
+    存在被判定为「非正常使用路径」的风险，请自行评估并承担；不需要时用 --no-greet 关闭。
+
 v1.0.2（2026-09-30）—— 新增活跃自检（连登预警）：
   - 「签到」与「连登」是**两套独立机制**：
       · 签到（/v2/billing/meter/daily-checkin）→ 发 Credits，本工具已覆盖；
@@ -47,9 +75,11 @@ v1.0.2（2026-09-30）—— 新增活跃自检（连登预警）：
   - 新增只读自检：GET /v2/activity/growth/heatmap 取 data.today.{score,is_active}，
     GET /v2/activity/growth/streak 取连登天数与补登卡余额，逐账号打印并写入日志/CSV；
     当天未点亮时在报告与桌面通知里显著提示「请手动发一条消息」。
-  - **刻意不做的事**：不代发对话、不调用模型接口。活动条款明令
+  - **v1.0.2 时不做的事**：不代发对话、不调用模型接口。活动条款明令
     「严禁采用刷量、多账号套利、篡改数据等作弊行为」「非正常使用路径触发风控，
-    平台有权取消领取资格并回收奖励」，故本工具在活跃维度只做「检测 + 提醒」。
+    平台有权取消领取资格并回收奖励」，故当时本工具在活跃维度只做「检测 + 提醒」。
+    → **v1.0.3 起改为可选代发**：按用户明确要求新增「每日问候」，默认开启，
+      但可用 --no-greet 一键回到纯检测模式；风险提示见上方 v1.0.3 段落。
   - CSV 新增列：今日活跃 / 活跃分 / 连登天数（列定义按文件首行表头自适应，
     历史月份的旧表头文件不受影响）。
 
@@ -62,8 +92,10 @@ v1.0.1（2026-09-28 事故后修订）：
 安全约定：
   - 任何输出（终端 / 日志 / 通知）都不包含完整 Token，一律脱敏。
   - accounts.json 是本工具唯一的凭据文件，含明文 Token，请勿外传 / 勿提交仓库。
-  - 写操作仅限 3 个已验证端点：daily-checkin、travel/claim、travel/depart。
+  - 写操作仅限已验证端点：daily-checkin、travel/claim、travel/depart，
+    以及**每日问候 chat/completions**（v1.0.3，可用 --no-greet 关闭）。
     活跃自检全程只读（GET）。
+  - 问候语与模型回复会写入 logs/（含明文的问候原文），不含 Token。
 """
 
 import argparse
@@ -81,13 +113,13 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 if sys.version_info < (3, 6):
     sys.stderr.write("需要 Python 3.6+，当前 %s\n" % sys.version.split()[0])
     sys.exit(2)
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 # ---------------- 路径与常量 ----------------
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -114,6 +146,39 @@ GROWTH_STREAK_PATH = "/activity/growth/streak"
 # 活跃分分档（前端配色函数：score<=0 无记录；<=10 / <=30 / <=60 / >60 共 4 档）
 ACTIVITY_SCORE_BANDS = ((0, "未点亮"), (10, "微亮"), (30, "常亮"), (60, "高亮"), (None, "炽热"))
 
+# ---------------- 每日问候（v1.0.3） ----------------
+# POST https://<domain>/v2/chat/completions
+# 实测：**必须 stream=true**（非流式回 400 / code 11101），请求头只需 Authorization。
+GREET_PATH = "/v2/chat/completions"
+GREET_DEFAULT_MODEL = "hy3"
+GREET_MODEL_CANDIDATES = ("hy3", "deepseek-v4.1-flash")
+# 随机发送窗口（本地时间，含头含尾）。窗口内随机取一个时刻，当天固定不变。
+GREET_WINDOW = ("03:00", "08:00")
+GREET_POLL_MINUTES = 15          # 计划任务轮询间隔，决定随机时刻的粒度
+GREET_MAX_ATTEMPTS = 3           # 单账号单日最多尝试次数（失败后在下一次轮询重试）
+GREET_REPLY_KEEP = 60            # 日志里保留的模型回复长度上限
+GREET_TIMEOUT = 45               # 流式请求整体超时（秒）
+GREET_HISTORY_KEEP = 12          # 记住最近用过的问候，避免短期内重复
+
+GREET_PHRASES = {
+    "汉语": ["你好", "早上好", "早上好呀", "新的一天开始了", "今天也一起加油"],
+    "英语": ["Hello", "Good morning", "Hi there", "Morning! Have a nice day",
+             "Hello, hope you have a great day"],
+    "俄语": ["Привет", "Доброе утро", "Здравствуйте", "Доброе утро, хорошего дня",
+             "Привет, как дела?"],
+    "法语": ["Bonjour", "Salut", "Bonjour, bonne journée", "Bonne matinée", "Coucou"],
+    "意大利语": ["Ciao", "Buongiorno", "Buongiorno, buona giornata", "Salve",
+                 "Ciao, come stai?"],
+    "德语": ["Hallo", "Guten Morgen", "Guten Morgen, schönen Tag noch",
+             "Moin", "Hallo, wie geht's?"],
+}
+
+# 问候状态文件：记录当天随机时刻、各账号发送结果（不含 Token）
+GREET_STATE_PATH = os.path.join(LOG_DIR, "greet_state.json")
+# 必须是**可重入**锁：greet_commit() 持锁期间会再调用 greet_state_today()，后者也要拿锁。
+# 用 threading.Lock() 会自死锁（进程挂死、无输出，极易误判成网络问题）。
+_greet_lock = threading.RLock()
+
 # 域名候选：配置里的 domain 优先，失败时按此顺序回退（实测三个都曾作为 auth.domain 出现）
 DEFAULT_DOMAINS = ["www.workbuddy.cn", "www.codebuddy.cn", "copilot.tencent.com"]
 
@@ -126,6 +191,21 @@ FALSE_ALREADY_DELAYS = (30, 60, 120)
 TRAVEL_STATE_TEXT = {"idle": "空闲(可派遣)", "traveling": "旅行中", "arrived": "已到达待领取"}
 
 _print_lock = threading.Lock()
+
+# 计划任务里的问候轮询用 pythonw.exe 启动（避免凌晨在屏幕上闪黑框），
+# 但 pythonw 下 sys.stdout / sys.stderr 是 None —— 此时任何 print() 都会抛
+# AttributeError 而**静默失败**。这里兜一层：没有流就接到日志文件上。
+if sys.stdout is None or sys.stderr is None:
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        _fallback_io = open(os.path.join(LOG_DIR, "no_console_stdout.log"), "a",
+                            encoding="utf-8", buffering=1)
+    except Exception:  # noqa: BLE001
+        _fallback_io = open(os.devnull, "w", encoding="utf-8")
+    if sys.stdout is None:
+        sys.stdout = _fallback_io
+    if sys.stderr is None:
+        sys.stderr = _fallback_io
 
 
 # ---------------- 基础工具 ----------------
@@ -219,6 +299,9 @@ DEFAULT_CONFIG = {
         "concurrency": 4,
         "travel_default": True,
         "desktop_notify": True,
+        # 每日问候（v1.0.3）：窗口内没赶上时是否补发；用哪个模型
+        "greet_catchup": True,
+        "greet_model": GREET_DEFAULT_MODEL,
     },
     "accounts": [],
 }
@@ -695,20 +778,254 @@ def check_activity(token):
     return out
 
 
+# ---------------- 每日问候（v1.0.3） ----------------
+def _hhmm(s):
+    """'HH:MM' → (hour, minute)；解析失败返回 (0, 0)。"""
+    try:
+        h, m = str(s).split(":")[:2]
+        return int(h), int(m)
+    except Exception:  # noqa: BLE001
+        return 0, 0
+
+
+def _at_hhmm(now, hhmm):
+    h, m = _hhmm(hhmm)
+    return now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+def greet_state_load():
+    """读问候状态文件（不存在/损坏一律当空处理）。"""
+    try:
+        with open(GREET_STATE_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def greet_state_save(state):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(GREET_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _greet_history(state):
+    h = state.get("history") if isinstance(state, dict) else None
+    return h if isinstance(h, list) else []
+
+
+def _pick_target(now=None):
+    """在 GREET_WINDOW 内均匀随机取一个时刻，返回 'HH:MM'。"""
+    now = now or datetime.now()
+    start = _at_hhmm(now, GREET_WINDOW[0])
+    end = _at_hhmm(now, GREET_WINDOW[1])
+    span = int((end - start).total_seconds())
+    if span <= 0:
+        return GREET_WINDOW[0]
+    return (start + timedelta(seconds=random.randint(0, span))).strftime("%H:%M")
+
+
+def pick_greeting(history=None):
+    """随机选一条问候，返回 (语言, 文本)。
+
+    优先挑最近没用过的（语言, 句子）组合，全部用过才回到全量随机，
+    避免连着几天都是同一句。六种语言等概率，不偏袒。
+    """
+    used = set()
+    for item in history or []:
+        if isinstance(item, dict) and item.get("lang") and item.get("text"):
+            used.add((item["lang"], item["text"]))
+    pool = [(lang, txt) for lang, texts in GREET_PHRASES.items() for txt in texts]
+    fresh = [p for p in pool if p not in used]
+    return random.choice(fresh if fresh else pool)
+
+
+def greet_state_today(now=None):
+    """取当天状态；跨天则重置当日字段（保留历史）。"""
+    now = now or datetime.now()
+    day = now.strftime("%Y-%m-%d")
+    with _greet_lock:
+        st = greet_state_load()
+        if st.get("date") != day:
+            st = {
+                "date": day,
+                "target": _pick_target(now),
+                "accounts": {},
+                "history": _greet_history(st)[-GREET_HISTORY_KEEP:],
+            }
+            greet_state_save(st)
+    return st
+
+
+def greet_plan(accounts, catchup=True, force=False, model=None, now=None):
+    """算出本次该不该发、给谁发。
+
+    force=True（--greet）忽略窗口与「当天已发」，强制重发。
+    返回 plan：due / reason / target / ids(待发账号 id 集合) / state / model
+    reason 取值：already_sent / wait / due / catchup / window_missed
+    """
+    now = now or datetime.now()
+    st = greet_state_today(now)
+    done = st.get("accounts") or {}
+    plan = {"due": False, "reason": "", "target": st.get("target"),
+            "ids": set(), "state": st, "model": model or GREET_DEFAULT_MODEL}
+
+    todo = []
+    for acc in accounts:
+        rec = done.get(acc.get("id")) or {}
+        if not force:
+            if rec.get("ok"):
+                continue                                   # 当天已成功
+            if int(rec.get("attempts") or 0) >= GREET_MAX_ATTEMPTS:
+                continue                                   # 当天重试次数用尽
+        todo.append(acc)
+
+    if not todo:
+        plan["reason"] = "already_sent"
+        return plan
+    if force:
+        plan.update(due=True, reason="forced", ids={a.get("id") for a in todo})
+        return plan
+
+    target = _at_hhmm(now, st.get("target") or GREET_WINDOW[0])
+    if now < target:
+        plan["reason"] = "wait"
+        return plan
+    if now <= _at_hhmm(now, GREET_WINDOW[1]):
+        plan.update(due=True, reason="due", ids={a.get("id") for a in todo})
+        return plan
+    if catchup:
+        plan.update(due=True, reason="catchup", ids={a.get("id") for a in todo})
+        return plan
+    plan["reason"] = "window_missed"
+    return plan
+
+
+def greet_send(token, text, model=GREET_DEFAULT_MODEL, domain=None, timeout=GREET_TIMEOUT):
+    """发一条问候并消费完整 SSE 流。
+
+    实测要点（勿改）：
+      · **必须 stream=true**，否则服务端回 400 / code=11101
+        "Non-stream chat request is currently not supported"（与鉴权无关）；
+      · 请求头只需 Authorization + Content-Type + Accept，无需客户端那套网关/ trace 头；
+      · 必须把流读到底，否则可能拿不到 finish_reason / usage，也可能服务端未记账。
+    """
+    url = "https://%s%s" % (domain or DEFAULT_DOMAINS[0], GREET_PATH)
+    payload = {"model": model, "stream": True,
+               "messages": [{"role": "user", "content": text}]}
+    out = {"ok": False, "reply": "", "tokens": None, "err": "", "http": None, "finish": ""}
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                     method="POST")
+        req.add_header("Authorization", "Bearer %s" % token)
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "text/event-stream")
+        req.add_header("User-Agent", "WorkBuddy-MultiCheckin/%s" % VERSION)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            out["http"] = resp.status
+            chunks = []
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    ev = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choice = (ev.get("choices") or [{}])[0]
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    chunks.append(delta["content"])
+                if choice.get("finish_reason"):
+                    out["finish"] = choice["finish_reason"]
+                if ev.get("usage"):
+                    out["tokens"] = ev["usage"]
+            out["reply"] = "".join(chunks)
+            out["ok"] = bool(out["reply"]) or out["finish"] == "stop"
+            if not out["ok"]:
+                out["err"] = "流式响应为空（可能被风控拦截）"
+    except urllib.error.HTTPError as e:
+        out["http"] = e.code
+        body = e.read().decode("utf-8", "replace")
+        try:
+            j = json.loads(body)
+            out["err"] = "HTTP %s code=%s %s" % (e.code, j.get("code"), j.get("msg") or "")
+        except Exception:  # noqa: BLE001
+            out["err"] = "HTTP %s %s" % (e.code, body[:160])
+    except Exception as e:  # noqa: BLE001
+        out["err"] = "%s: %s" % (type(e).__name__, e)
+    return out
+
+
+def run_greet_one(acc, plan):
+    """给单个账号发问候，返回结果片段（供报告 / CSV 使用）。"""
+    res = {"ok": False, "lang": None, "text": None, "reply": "", "err": "",
+           "model": plan.get("model") or GREET_DEFAULT_MODEL, "at": now_str(),
+           "catchup": plan.get("reason") == "catchup", "http": None, "tokens": None,
+           "domain": acc.get("domain") or DEFAULT_DOMAINS[0]}
+    token = clean_token(acc.get("token"))
+    if not token:
+        res["err"] = "未配置 Token，请用 --capture 或 --set-token 补充"
+        return res
+    lang, text = pick_greeting(_greet_history(plan.get("state") or {}))
+    res["lang"], res["text"] = lang, text
+    r = greet_send(token, text, model=res["model"], domain=acc.get("domain"))
+    res.update(http=r.get("http"), tokens=r.get("tokens"),
+               reply=(r.get("reply") or "")[:GREET_REPLY_KEEP], ok=bool(r.get("ok")))
+    if not res["ok"]:
+        res["err"] = r.get("err") or "发送失败"
+    return res
+
+
+def greet_commit(plan, results):
+    """把本次发送结果写回状态：成功记 ok，失败累计 attempts，并记入历史。"""
+    if not isinstance(plan, dict):
+        return
+    with _greet_lock:
+        st = greet_state_today()
+        recs = st.setdefault("accounts", {})
+        hist = _greet_history(st)
+        for r in results:
+            g = r.get("greet")
+            if not isinstance(g, dict):
+                continue
+            cur = recs.get(r.get("id")) or {}
+            if g.get("ok"):
+                cur.update(ok=True, at=g.get("at"), lang=g.get("lang"),
+                           text=g.get("text"), reply=g.get("reply"),
+                           model=g.get("model"), catchup=g.get("catchup"),
+                           attempts=int(cur.get("attempts") or 0) + 1)
+                hist.append({"date": st.get("date"), "lang": g.get("lang"),
+                             "text": g.get("text")})
+            else:
+                cur.update(ok=False, at=g.get("at"), err=g.get("err"),
+                           attempts=int(cur.get("attempts") or 0) + 1)
+            recs[r.get("id")] = cur
+        st["history"] = hist[-GREET_HISTORY_KEEP:]
+        greet_state_save(st)
+
+
 # ---------------- 单账号全流程 ----------------
 def run_one(acc, settings, do_check=True, check_only=False, travel_mode="auto",
-            location_id=None, activity_mode="auto"):
+            location_id=None, activity_mode="auto", greet_plan_=None):
     """单账号全流程。
 
     do_check：是否执行签到；check_only：签到只读；travel_mode: auto/readonly/off
-    activity_mode: auto/off —— 只读活跃自检（连登预警），永不代发对话
+    activity_mode: auto/off —— 只读活跃自检（连登预警）
+    greet_plan_：greet_plan() 的结果；仅当本账号在待发集合里才发问候
     """
     started = time.time()
     res = {
         "id": acc.get("id"), "label": acc.get("label"), "uid_masked": mask_id(acc.get("uid")),
         "status": "error", "action": None, "points": None, "balance": None, "streak_days": None,
         "domain": None, "token_masked": mask_token(acc.get("token")), "msg": "", "travel": None,
-        "activity": None, "detail": {},
+        "activity": None, "greet": None, "detail": {},
     }
     token = clean_token(acc.get("token"))
     if not token:
@@ -768,6 +1085,36 @@ def run_one(acc, settings, do_check=True, check_only=False, travel_mode="auto",
             res["action"] = "activity"
             if not ac.get("ok"):
                 res["msg"] = ac.get("msg") or "活跃自检失败"
+
+    if greet_plan_ and acc.get("id") in greet_plan_.get("ids", ()):
+        g = run_greet_one(acc, greet_plan_)
+        res["greet"] = g
+        if not res.get("domain"):
+            res["domain"] = g.get("domain") or acc.get("domain") or DEFAULT_DOMAINS[0]
+        if g.get("ok"):
+            bit = "问候：%s「%s」已发送%s" % (g["lang"], g["text"],
+                                          "（补发）" if g.get("catchup") else "")
+        else:
+            bit = "问候：发送失败（%s）" % g.get("err")
+        res["msg"] = (res["msg"] + " ｜ " + bit) if res["msg"] else bit
+        if not do_check and travel_mode == "off" and activity_mode == "off":
+            # 纯问候模式：整体状态由问候结果决定
+            res["status"] = "ok" if g.get("ok") else "error"
+            res["action"] = "greet"
+            if not g.get("ok"):
+                res["msg"] = "每日问候失败：%s" % g.get("err")
+    elif (greet_plan_ and not do_check and travel_mode == "off"
+            and activity_mode == "off"):
+        # 纯问候模式但本次无需发送：这是**正常跳过**，不能算失败
+        skip_why = {"already_sent": "今日问候已发送，本次跳过",
+                    "wait": "未到今日随机时刻（%s），本次跳过" % greet_plan_.get("target"),
+                    "window_missed": "已过 03:00-08:00 窗口且未开启补发，本次跳过"}
+        res["status"] = "ok"
+        res["action"] = "greet_skipped"
+        res["msg"] = skip_why.get(greet_plan_.get("reason"),
+                                  "本次无需发送（%s）" % greet_plan_.get("reason"))
+        if not res.get("domain"):
+            res["domain"] = acc.get("domain") or DEFAULT_DOMAINS[0]
 
     res["elapsed_ms"] = int((time.time() - started) * 1000)
     return res
@@ -1043,9 +1390,12 @@ def cmd_notify(args):
 
 def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="auto",
                 location_id=None, workers=None, notify=None, as_json=False,
-                show_progress=True, activity_mode="auto"):
+                show_progress=True, activity_mode="auto", greet_mode="auto",
+                greet_catchup=True, greet_model=None, greet_force=False):
     """跑完一批账号，负责并发、日志、报表与通知。
 
+    greet_mode: auto/off —— 每日问候（默认开启）。auto 时按窗口/幂等/补发规则决定
+                本次是否真的发送；off 则完全不调用模型接口。
     返回 (results, elapsed, exit_code)。
     """
     settings = cfg["settings"]
@@ -1058,20 +1408,35 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
     workers = max(1, min(int(workers), len(accounts)))
     if notify is None:
         notify = bool(settings.get("desktop_notify", True))
+    if greet_catchup is None:
+        greet_catchup = bool(settings.get("greet_catchup", True))
+    if not greet_model:
+        greet_model = settings.get("greet_model") or GREET_DEFAULT_MODEL
+
+    gp = None
+    if greet_mode != "off":
+        gp = greet_plan(accounts, catchup=greet_catchup, force=greet_force,
+                        model=greet_model)
 
     if show_progress and not as_json:
-        if not do_check and travel_mode == "off":
-            mode_bits = ["只做活跃自检"]
-        elif not do_check:
-            mode_bits = ["只派小猫"]
-        elif check_only:
-            mode_bits = ["只查询"]
+        mode_bits = []
+        if do_check:
+            mode_bits.append("只查询" if check_only else "签到+派小猫")
+            if activity_mode != "off":
+                mode_bits.append("活跃自检")
+            if travel_mode == "readonly":
+                mode_bits.append("旅行只读")
+        elif travel_mode != "off":
+            mode_bits.append("只派小猫")
+            if activity_mode != "off":
+                mode_bits.append("活跃自检")
+        elif activity_mode != "off":
+            mode_bits.append("只做活跃自检")
         else:
-            mode_bits = ["签到+派小猫"]
-        if activity_mode != "off" and (do_check or travel_mode != "off"):
-            mode_bits.append("活跃自检")
-        if travel_mode == "readonly" and do_check:
-            mode_bits.append("旅行只读")
+            mode_bits.append("只发问候")
+        if gp and gp.get("due"):
+            mode_bits.append("每日问候（补发）" if gp.get("reason") == "catchup"
+                             else "每日问候")
         print("开始处理 %d 个账号（并发 %d，模式：%s）…"
               % (len(accounts), workers, " + ".join(mode_bits)))
 
@@ -1080,7 +1445,7 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {pool.submit(run_one, acc, settings, do_check, check_only, travel_mode,
                             location_id if location_id else acc.get("location_id"),
-                            activity_mode): acc
+                            activity_mode, gp): acc
                 for acc in accounts}
         for fut in concurrent.futures.as_completed(futs):
             acc = futs[fut]
@@ -1098,12 +1463,17 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
     results.sort(key=lambda r: str(r.get("id")))
     elapsed = time.time() - started
 
+    if gp:
+        greet_commit(gp, results)
+
     write_logs(results)
     if as_json:
         print(json.dumps({"time": now_str(), "elapsed_s": round(elapsed, 2),
+                          "greet_plan": ({"due": gp.get("due"), "reason": gp.get("reason"),
+                                          "target": gp.get("target")} if gp else None),
                           "results": results}, ensure_ascii=False, indent=2))
     else:
-        print_report(results, elapsed, do_check, check_only, travel_mode)
+        print_report(results, elapsed, do_check, check_only, travel_mode, gp)
         print("日志：%s" % LOG_DIR)
 
     # 连登风险：有账号当天未点亮活跃（即便签到成功，连登仍有断档风险）
@@ -1116,6 +1486,10 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
         bad = [r for r in results if r["status"] != "ok"]
         signed = [r for r in results if r["action"] == "signed"]
         pts = sum(r["points"] or 0 for r in signed)
+        greeted = [r for r in results if isinstance(r.get("greet"), dict)
+                   and r["greet"].get("ok")]
+        gfail = [r for r in results if isinstance(r.get("greet"), dict)
+                 and not r["greet"].get("ok")]
         if risk:
             title = "WorkBuddy 活跃预警：%d 个账号今日未点亮" % len(risk)
         elif do_check:
@@ -1124,8 +1498,17 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
             title = "WorkBuddy 自检：%d/%d 成功" % (len(ok), len(results))
         if do_check:
             body = ("新签 %d 个账号 +%s 积分" % (len(signed), pts)) if signed else "今日均已签到"
+        elif greeted:
+            body = "每日问候已发送 %d 个账号" % len(greeted)
         else:
             body = "小猫旅行已处理 %d 个账号" % len(ok)
+        if greeted and not do_check:
+            pass
+        elif greeted:
+            body += " ｜ 问候 %d 条" % len(greeted)
+        if gfail:
+            body += " ｜ 问候失败 %d：%s" % (len(gfail),
+                                          "，".join(str(g.get("label")) for g in gfail))
         if activity_mode != "off" and not risk:
             lit = [r for r in results if isinstance(r.get("activity"), dict)
                    and r["activity"].get("ok") and r["activity"].get("active")]
@@ -1141,7 +1524,8 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
 
 
 # ---------------- 输出与通知 ----------------
-def print_report(results, elapsed, do_check=True, check_only=False, travel_mode="auto"):
+def print_report(results, elapsed, do_check=True, check_only=False, travel_mode="auto",
+                 gp=None):
     ok = [r for r in results if r["status"] == "ok"]
     bad = [r for r in results if r["status"] != "ok"]
     signed = [r for r in results if r["action"] == "signed"]
@@ -1166,7 +1550,18 @@ def print_report(results, elapsed, do_check=True, check_only=False, travel_mode=
                          ac.get("score"), ac.get("band"), ac.get("streak_days"),
                          " ｜ 更新于 %s" % ac["updated_at"] if ac.get("updated_at") else ""))
                 if not ac.get("active"):
-                    print("          ⚠ 连登有断档风险：请在 WorkBuddy 里手动发一条消息")
+                    print("          ⚠ 连登有断档风险：请手动发一条消息（或用问候功能自动点亮）")
+        g = r.get("greet") if isinstance(r.get("greet"), dict) else None
+        if g:
+            if g.get("ok"):
+                print("    问候：%s「%s」已发送%s ｜ 模型 %s ｜ 回复：%s"
+                      % (g.get("lang"), g.get("text"),
+                         "（补发）" if g.get("catchup") else "",
+                         g.get("model"), (g.get("reply") or "")[:40]))
+            else:
+                print("    问候：**发送失败** — %s" % g.get("err"))
+        elif r.get("action") == "greet_skipped":
+            print("    问候：%s" % (r.get("msg") or "本次跳过"))
         if r["status"] != "ok":
             print("    结果：%s" % r["msg"])
             d = r.get("detail") or {}
@@ -1199,12 +1594,32 @@ def print_report(results, elapsed, do_check=True, check_only=False, travel_mode=
               % (r.get("token_masked"), r.get("domain") or "-", r.get("elapsed_ms")))
 
     print("-" * 92)
-    if not do_check and travel_mode == "off":
-        print("汇总：成功 %d / 失败 %d ｜ 模式：只做活跃自检（全程只读，未发起任何写请求）"
-              % (len(ok), len(bad)))
-    else:
+    if do_check:
         print("汇总：成功 %d / 失败 %d ｜ 本次新签 %d 个账号(+%s 积分) ｜ 今日已签 %d"
               % (len(ok), len(bad), len(signed), total_points, len(skipped)))
+    else:
+        kinds = []
+        g_done = [r["greet"] for r in results if isinstance(r.get("greet"), dict)]
+        g_skip = [r for r in results if r.get("action") == "greet_skipped"]
+        if g_done:
+            kinds.append("每日问候 %d/%d" % (sum(1 for x in g_done if x.get("ok")), len(g_done)))
+        elif g_skip:
+            kinds.append("每日问候（%d 个账号本次跳过）" % len(g_skip))
+        if any(isinstance(r.get("travel"), dict) for r in results):
+            kinds.append("小猫旅行")
+        if any(isinstance(r.get("activity"), dict) for r in results):
+            kinds.append("活跃自检（只读）")
+        print("汇总：成功 %d / 失败 %d ｜ 模式：%s"
+              % (len(ok), len(bad), " + ".join(kinds) or "只读"))
+
+    if gp is not None:
+        reasons = {"due": "窗口内到点", "catchup": "错过窗口，补发",
+                   "forced": "手动强制", "already_sent": "当天已发送",
+                   "wait": "未到今日随机时刻", "window_missed": "已过窗口且未开启补发"}
+        why = reasons.get(gp.get("reason"), str(gp.get("reason")))
+        head = "本次已投递" if gp.get("due") else "本次不发送"
+        print("问候：%s（%s）｜ 今日目标时刻 %s ｜ 模型 %s"
+              % (head, why, gp.get("target") or "-", gp.get("model") or "-"))
 
     acts = [r["activity"] for r in results
             if isinstance(r.get("activity"), dict) and r["activity"].get("ok")]
@@ -1263,21 +1678,61 @@ def _read_csv_header(path):
         return None
 
 
+def _upgrade_csv_header(path, header, wanted):
+    """既有文件缺列时，把缺失列**追加到末尾**并回写；返回 (新表头, 是否改动)。
+
+    为什么是"追加到末尾"而不是按 wanted 的顺序重排：重排会让历史行的列语义整体
+    错位。只追加则既有列位置、含义、历史数据全部不变，尾部多出几列空值而已。
+    首次改动前留一份 .bak，便于回退。
+    """
+    missing = [c for c in wanted if c not in header]
+    if not missing:
+        return header, False
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.reader(f))
+    except Exception:  # noqa: BLE001
+        return header, False
+    if not rows:
+        return header, False
+    width = len(header)
+    out = [list(header) + missing]
+    for row in rows[1:]:
+        r = list(row)[:width]
+        if len(r) < width:
+            r += [""] * (width - len(r))
+        out.append(r + [""] * len(missing))
+    try:
+        if not os.path.isfile(path + ".bak"):
+            with open(path + ".bak", "w", encoding="utf-8-sig", newline="") as f:
+                csv.writer(f).writerows(rows)
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            csv.writer(f).writerows(out)
+    except Exception:  # noqa: BLE001
+        return header, False
+    return list(header) + missing, True
+
+
 def write_logs(results):
     """追加 CSV 明细 + 覆写 last_run.json（均不含完整 Token）。
 
-    CSV 列按**文件首行表头自适应**：v1.0.2 新增的「今日活跃/活跃分/连登天数」只写进
-    新创建的文件（下个月自然生效）；已存在的旧表头文件仍按原列写，不会串列。
+    CSV 列按**文件首行表头自适应**，且缺列时自动升级：
+      · 读取以首行表头为准，按表头逐列取值，历史文件绝不串列；
+      · 当前月份文件若缺 v1.0.3 的问候列，会**把缺列追加到末尾**并补齐历史行
+        （改前留 .bak）。只追加不重排，既有列位置与语义完全不变。
+      · 历史月份的文件永远不会被打开写入，因此始终原样保留。
     """
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         csv_path = os.path.join(LOG_DIR, "checkin-%s.csv" % datetime.now().strftime("%Y-%m"))
         wanted = ["时间", "账号ID", "账号名", "UID", "状态", "动作", "积分", "余额",
                   "已结算连签天数", "今日活跃", "活跃分", "连登天数",
+                  "问候语言", "问候语", "问候结果", "问候回复",
                   "小猫状态", "小猫地点", "域名", "说明"]
         if os.path.isfile(csv_path):
             header = _read_csv_header(csv_path) or wanted
             new_file = False
+            header, _ = _upgrade_csv_header(csv_path, header, wanted)
         else:
             header = wanted
             new_file = True
@@ -1285,6 +1740,13 @@ def write_logs(results):
         def row_of(r):
             tv = r.get("travel") or {}
             ac = r.get("activity") if isinstance(r.get("activity"), dict) else {}
+            gr = r.get("greet") if isinstance(r.get("greet"), dict) else {}
+            if not gr:
+                g_status = ""
+            elif gr.get("ok"):
+                g_status = "已发送（补发）" if gr.get("catchup") else "已发送"
+            else:
+                g_status = "失败：%s" % (gr.get("err") or "未知")
             cell = {
                 "时间": now_str(), "账号ID": r.get("id"), "账号名": r.get("label"),
                 "UID": r.get("uid_masked"), "状态": r.get("status"), "动作": r.get("action"),
@@ -1293,6 +1755,10 @@ def write_logs(results):
                 "今日活跃": ("是" if ac.get("active") else "否") if ac.get("ok") else "",
                 "活跃分": ac.get("score") if ac.get("ok") else "",
                 "连登天数": ac.get("streak_days") if ac.get("ok") else "",
+                "问候语言": gr.get("lang") or "",
+                "问候语": gr.get("text") or "",
+                "问候结果": g_status,
+                "问候回复": gr.get("reply") or "",
                 "小猫状态": tv.get("state_text"), "小猫地点": tv.get("location_name"),
                 "域名": r.get("domain"), "说明": r.get("msg"),
             }
@@ -1361,16 +1827,113 @@ def cmd_diagnose(args):
     return 0
 
 
+# ---------------- 每日问候的命令行入口 ----------------
+def _greet_trace(line):
+    """把问候轮询的判定结果追加到 logs/greet_trace.log，便于事后排查。"""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(os.path.join(LOG_DIR, "greet_trace.log"), "a", encoding="utf-8") as f:
+            f.write("%s  %s\n" % (now_str(), line))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def cmd_greet_status(args):
+    """打印今日问候的调度与发送情况（只读，不初始化状态）。"""
+    cfg = load_config()
+    accounts = select_accounts(cfg, args.accounts)
+    st = greet_state_load()
+    today = datetime.now().strftime("%Y-%m-%d")
+    print("WorkBuddy 每日问候 · 状态 v%s" % VERSION)
+    print("-" * 92)
+    print("随机窗口     : %s ~ %s（每 %d 分钟轮询一次）"
+          % (GREET_WINDOW[0], GREET_WINDOW[1], GREET_POLL_MINUTES))
+    print("模型         : %s" % (cfg["settings"].get("greet_model") or GREET_DEFAULT_MODEL))
+    print("错过补发     : %s"
+          % ("开启" if cfg["settings"].get("greet_catchup", True) else "关闭"))
+    print("状态文件     : %s" % GREET_STATE_PATH)
+    if st.get("date") == today:
+        print("今日随机时刻 : %s（当天固定不变）" % (st.get("target") or "-"))
+    else:
+        print("今日随机时刻 : 尚未生成（首次运行或到点轮询时确定）")
+    print("-" * 92)
+    if not accounts:
+        print("没有可执行的账号。")
+        return 2
+    recs = (st.get("accounts") or {}) if st.get("date") == today else {}
+    for acc in accounts:
+        rec = recs.get(acc.get("id")) or {}
+        if rec.get("ok"):
+            line = "✓ 已发送 %s ｜ %s「%s」" % (rec.get("at") or "-",
+                                            rec.get("lang"), rec.get("text"))
+            if rec.get("catchup"):
+                line += "（补发）"
+        elif rec.get("attempts"):
+            line = "✗ 未成功（已试 %s 次）：%s" % (rec.get("attempts"), rec.get("err") or "")
+        else:
+            line = "· 今日尚未发送"
+        print("%-12s %s" % (acc.get("label"), line))
+    hist = _greet_history(st)
+    if hist:
+        print("-" * 92)
+        print("最近用过的问候（共 %d 条）：" % len(hist))
+        for h in hist[-6:]:
+            print("  %s  %s「%s」" % (h.get("date"), h.get("lang"), h.get("text")))
+    return 0
+
+
+def cmd_greet_window(args):
+    """计划任务入口：轮询判断是否到点该发问候，不该发就静默退出。
+
+    刻意不弹桌面通知——凌晨触发时打扰用户没有意义，判定过程只写 greet_trace.log。
+    """
+    cfg = load_config()
+    accounts = select_accounts(cfg, args.accounts)
+    if not accounts:
+        return 2
+    catchup = bool(cfg["settings"].get("greet_catchup", True))
+    model = cfg["settings"].get("greet_model") or GREET_DEFAULT_MODEL
+    gp = greet_plan(accounts, catchup=catchup, model=model)
+    if not gp.get("due"):
+        _greet_trace("跳过（%s）｜ 目标 %s" % (gp.get("reason"), gp.get("target")))
+        return 0
+    _greet_trace("到点投递（%s）｜ 目标 %s ｜ 账号 %s"
+                 % (gp.get("reason"), gp.get("target"),
+                    "，".join(str(a.get("label")) for a in accounts)))
+    _, _, code = execute_run(cfg, accounts, do_check=False, travel_mode="off",
+                             activity_mode="off", notify=False, greet_mode="auto",
+                             greet_catchup=catchup, greet_model=model)
+    return code
+
+
+def cmd_greet_reset(args):
+    """重置今日问候状态（便于手动重发或调试），会重新抽一个随机时刻。"""
+    st = greet_state_load()
+    day = datetime.now().strftime("%Y-%m-%d")
+    if st.get("date") == day:
+        st["accounts"] = {}
+        st["target"] = _pick_target()
+        greet_state_save(st)
+        print("已重置今日（%s）问候状态；新的随机时刻：%s" % (day, st["target"]))
+    else:
+        print("今日（%s）尚无问候记录，无需重置。" % day)
+    return 0
+
+
 # ---------------- main ----------------
 def build_parser():
     p = argparse.ArgumentParser(
-        description="WorkBuddy 多账号自动签到 + 派小猫旅行（独立运行，不依赖 WorkBuddy 登录态）",
+        description="WorkBuddy 多账号自动签到 + 派小猫旅行 + 每日问候（独立运行，不依赖 WorkBuddy 登录态）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例：\n"
                "  python wb_checkin_multi.py --menu              # 交互式菜单（推荐）\n"
                "  python wb_checkin_multi.py --capture          # 首次：提取 Token\n"
                "  python wb_checkin_multi.py --list             # 查看账号与有效期\n"
-               "  python wb_checkin_multi.py                     # 每日：全部账号签到+派猫\n")
+               "  python wb_checkin_multi.py                     # 每日：全部账号签到+派猫+问候\n"
+               "  python wb_checkin_multi.py --greet-only --greet  # 立即强制发一条问候\n"
+               "  python wb_checkin_multi.py --greet-status     # 看今天问候发了没\n"
+               "  python wb_checkin_multi.py --greet-window     # 计划任务入口（每15分钟轮询）\n"
+               "  python wb_checkin_multi.py --no-greet         # 今天不发问候（纯签到）\n")
     p.add_argument("--capture", action="store_true", help="从本机历史登录态提取 Token 写入配置")
     p.add_argument("--capture-dir", help="自定义登录态目录（配合 --capture）")
     p.add_argument("--label-prefix", help="capture 时给账号名加统一前缀，如 公司")
@@ -1398,6 +1961,19 @@ def build_parser():
     p.add_argument("--activity-only", action="store_true",
                    help="只做活跃自检（读活跃地图/连登，连登中断预警；全程只读）")
     p.add_argument("--no-activity", action="store_true", help="跳过活跃自检")
+    p.add_argument("--greet-only", action="store_true",
+                   help="只发每日问候（不做签到、不派小猫、不做活跃自检）")
+    p.add_argument("--no-greet", action="store_true",
+                   help="跳过每日问候（不向模型发起任何对话）")
+    p.add_argument("--greet", action="store_true",
+                   help="立即强制发送问候（忽略随机窗口与当天已发；单独使用时等价于 --greet-only --greet）")
+    p.add_argument("--greet-window", action="store_true",
+                   help="计划任务入口：轮询判断是否到点该发问候，不该发则静默退出")
+    p.add_argument("--greet-status", action="store_true", help="查看今日问候的调度与发送情况")
+    p.add_argument("--greet-reset", action="store_true", help="重置今日问候状态（可重新抽取随机时刻）")
+    p.add_argument("--greet-model", metavar="模型", help="问候所用模型，默认 hy3")
+    p.add_argument("--no-greet-catchup", action="store_true",
+                   help="错过 03:00-08:00 窗口后不再补发（严格只在窗口内发送）")
     p.add_argument("--location", type=int, choices=[1, 2, 3, 4], help="派遣地点（1-4，缺省随机）")
     p.add_argument("--accounts", help="只跑指定账号，逗号分隔 id 或 label")
     p.add_argument("--concurrency", type=int, help="并发线程数（默认取配置，建议 3-6）")
@@ -1434,6 +2010,12 @@ def main():
         return cmd_set_location(args)
     if args.notify:
         return cmd_notify(args)
+    if args.greet_status:
+        return cmd_greet_status(args)
+    if args.greet_reset:
+        return cmd_greet_reset(args)
+    if args.greet_window:
+        return cmd_greet_window(args)
 
     cfg = load_config()
     accounts = select_accounts(cfg, args.accounts)
@@ -1442,9 +2024,17 @@ def main():
               % os.path.basename(__file__))
         return 2
 
+    # --greet 单独使用时等价于「只发问候」，避免误把整套签到也跑一遍
+    greet_only = bool(args.greet_only or
+                      (args.greet and not (args.activity_only or args.travel_only)))
+
     if args.activity_only:
         do_check = False
         check_only = bool(args.check_only)
+        travel_mode = "off"
+    elif greet_only:
+        do_check = False
+        check_only = False
         travel_mode = "off"
     elif args.travel_only:
         do_check = False
@@ -1455,13 +2045,17 @@ def main():
         check_only = bool(args.check_only)
         travel_mode = "off" if args.no_travel else ("readonly" if args.check_only else "auto")
 
-    activity_mode = "off" if args.no_activity else "auto"
+    # 纯问候模式下关掉活跃自检：活跃地图每日 02:00 才聚合，当场读不到刚发的问候
+    activity_mode = "off" if (args.no_activity or greet_only) else "auto"
+    greet_mode = "off" if args.no_greet else "auto"
 
     _, _, code = execute_run(
         cfg, accounts, do_check=do_check, check_only=check_only,
         travel_mode=travel_mode, location_id=args.location,
         workers=args.concurrency, notify=(not args.no_notify), as_json=args.json,
-        activity_mode=activity_mode)
+        activity_mode=activity_mode, greet_mode=greet_mode,
+        greet_catchup=(False if args.no_greet_catchup else None),
+        greet_model=args.greet_model, greet_force=bool(args.greet))
     return code
 
 

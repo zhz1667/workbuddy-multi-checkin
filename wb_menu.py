@@ -26,6 +26,7 @@ if HERE not in sys.path:
 import wb_checkin_multi as core  # noqa: E402
 
 TASK_NAME = "WorkBuddy-MultiCheckin"
+GREET_TASK_NAME = "WorkBuddy-Greet"
 LOCATION_NAMES = {1: "咖啡馆", 2: "商场店铺", 3: "健身房", 4: "古镇客栈"}
 
 
@@ -144,7 +145,7 @@ def header():
         else:
             print("  Token：%s" % C.w("全部正常", C.GREEN))
     else:
-        print("  %s" % C.w("尚未配置账号 → 请选「7 → 1」从本机登录态提取", C.YELLOW))
+        print("  %s" % C.w("尚未配置账号 → 请选「8 → 1」从本机登录态提取", C.YELLOW))
     line("═")
 
 
@@ -152,7 +153,7 @@ def print_accounts():
     cfg = core.load_config()
     accounts = cfg["accounts"]
     if not accounts:
-        print(C.w("  还没有账号。请先选「7 → 1」从本机登录态提取，或「7 → 2」手工添加。", C.YELLOW))
+        print(C.w("  还没有账号。请先选「8 → 1」从本机登录态提取，或「8 → 2」手工添加。", C.YELLOW))
         return
     print("  %s %s %s %s %s %s"
           % (core.pad("编号", 6), core.pad("账号名", 16), core.pad("uid", 11),
@@ -180,7 +181,8 @@ def print_accounts():
 
 
 def run_and_show(check_only=False, do_check=True, travel_mode="auto",
-                 accounts=None, location_id=None, title="执行结果", activity_mode="auto"):
+                 accounts=None, location_id=None, title="执行结果", activity_mode="auto",
+                 greet_mode="auto", greet_force=False):
     cfg = core.load_config()
     accs = accounts if accounts is not None else core.select_accounts(cfg)
     if not accs:
@@ -192,16 +194,17 @@ def run_and_show(check_only=False, do_check=True, travel_mode="auto",
     core.execute_run(cfg, accs, do_check=do_check, check_only=check_only,
                      travel_mode=travel_mode, location_id=location_id,
                      show_progress=True, activity_mode=activity_mode,
+                     greet_mode=greet_mode, greet_force=greet_force,
                      notify=bool(cfg["settings"].get("desktop_notify", True)))
 
 
 # ---------------- 各菜单动作 ----------------
 def act_run_full():
-    run_and_show(title="签到 + 派小猫 + 活跃自检（全部启用账号）")
+    run_and_show(title="签到 + 派小猫 + 活跃自检 + 每日问候（全部启用账号）")
 
 
 def act_run_checkin_only():
-    run_and_show(travel_mode="off", title="只签到（不派小猫，仍做活跃自检）")
+    run_and_show(travel_mode="off", title="只签到（不派小猫，仍做活跃自检，仍会补发问候）")
 
 
 def act_run_travel_only():
@@ -209,11 +212,52 @@ def act_run_travel_only():
 
 
 def act_run_activity_only():
-    run_and_show(do_check=False, travel_mode="off", title="只做活跃自检（连登中断预警，只读）")
+    run_and_show(do_check=False, travel_mode="off", activity_mode="auto", greet_mode="off",
+                 title="只做活跃自检（连登中断预警，只读）")
 
 
 def act_run_status_only():
-    run_and_show(check_only=True, do_check=True, travel_mode="readonly", title="只查询状态（只读）")
+    run_and_show(check_only=True, do_check=True, travel_mode="readonly", greet_mode="off",
+                 title="只查询状态（只读）")
+
+
+# --- 每日问候 ---
+def act_greet_force():
+    print(C.w("  将立即向每个账号发一条随机语言问候（忽略随机窗口与「当天已发」）。", C.DIM))
+    run_and_show(do_check=False, travel_mode="off", activity_mode="off",
+                 greet_force=True, title="立即强制发送每日问候")
+
+
+def act_greet_status():
+    print()
+    core.cmd_greet_status(argparse.Namespace(accounts=None))
+
+
+def act_greet_reset():
+    if not confirm("  确认重置今日问候状态？（会重新抽一个随机时刻，之后可再次发送）"):
+        print(C.w("  已取消。", C.DIM))
+        return
+    print()
+    core.cmd_greet_reset(argparse.Namespace(accounts=None))
+
+
+def act_greet_preview():
+    """只看看随机机制会抽到什么，不发任何请求。"""
+    print()
+    print(C.w("  随机抽 8 次（仅演示，不会发送任何请求）：", C.DIM))
+    print()
+    hist = core._greet_history(core.greet_state_load())
+    for _ in range(8):
+        lang, text = core.pick_greeting(hist)
+        print("    %s  %s" % (core.pad(lang, 12), text))
+    print()
+    print("    %s" % C.w("候选共 %d 条：%s"
+                        % (sum(len(v) for v in core.GREET_PHRASES.values()),
+                           "，".join("%s %d 条" % (k, len(v))
+                                     for k, v in core.GREET_PHRASES.items())), C.DIM))
+    tgt = core.greet_state_load().get("target")
+    print("    %s" % C.w("今日随机时刻：%s（窗口 %s-%s，当天固定不变）"
+                        % (tgt or "尚未生成", core.GREET_WINDOW[0], core.GREET_WINDOW[1]), C.DIM))
 
 
 def act_run_selected():
@@ -240,15 +284,20 @@ def act_run_selected():
         print(C.w("  没有匹配到账号。", C.YELLOW))
         return
     print(C.w("  已选：%s" % "，".join(a.get("label") for a in picked), C.GREEN))
-    mode = ask("  模式 1=签到+派小猫  2=只签到  3=只派小猫  4=只查询  5=只做活跃自检", "1")
-    table = {"1": (True, False, "auto", "签到 + 派小猫 + 活跃自检"),
-             "2": (True, False, "off", "只签到"),
-             "3": (False, False, "auto", "只派小猫"),
-             "4": (True, True, "readonly", "只查询状态"),
-             "5": (False, False, "off", "只做活跃自检")}
-    picked_mode = table.get(str(mode).strip(), table["1"])
-    do_check, check_only, travel_mode, label = picked_mode
+    mode = ask("  模式 1=签到+派小猫  2=只签到  3=只派小猫  4=只查询  5=只做活跃自检  6=只发问候", "1")
+    # (do_check, check_only, travel_mode, activity_mode, greet_mode, greet_force, label)
+    table = {
+        "1": (True, False, "auto", "auto", "auto", False, "签到 + 派小猫 + 活跃自检 + 问候"),
+        "2": (True, False, "off", "auto", "auto", False, "只签到（仍做活跃自检，仍会补发问候）"),
+        "3": (False, False, "auto", "auto", "auto", False, "只派小猫"),
+        "4": (True, True, "readonly", "auto", "off", False, "只查询状态（只读）"),
+        "5": (False, False, "off", "auto", "off", False, "只做活跃自检"),
+        "6": (False, False, "off", "off", "auto", True, "立即强制发每日问候"),
+    }
+    do_check, check_only, travel_mode, act_mode, g_mode, g_force, label = \
+        table.get(str(mode).strip(), table["1"])
     run_and_show(check_only=check_only, do_check=do_check, travel_mode=travel_mode,
+                 activity_mode=act_mode, greet_mode=g_mode, greet_force=g_force,
                  accounts=picked, title=label)
 
 
@@ -361,49 +410,53 @@ def _run_ps(command, timeout=90):
         return 1, str(e)
 
 
-_task_cache = {"at": 0.0, "installed": False, "info": {}}
-_TASK_TTL = 20  # 秒：避免每次刷新菜单都启动一次 PowerShell
+_task_cache = {}   # 任务名 -> {"at": 时间戳, "installed": 布尔, "info": 字典}
+_TASK_TTL = 20     # 秒：避免每次刷新菜单都启动一次 PowerShell
 
 
-def task_state(force=False):
+def task_state(force=False, name=None):
     """返回 (是否已安装, 状态字典)。结果缓存 20 秒；只取 ASCII 值，规避控制台编码问题。"""
+    name = name or TASK_NAME
     if sys.platform != "win32":
         return False, {}
     now = time.time()
-    if not force and (now - _task_cache["at"]) < _TASK_TTL and _task_cache["at"] > 0:
-        return _task_cache["installed"], _task_cache["info"]
+    cached = _task_cache.get(name)
+    if not force and cached and (now - cached["at"]) < _TASK_TTL:
+        return cached["installed"], cached["info"]
     cmd = ("$t=Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue;"
            "if($t){$i=Get-ScheduledTaskInfo -TaskName '%s';"
            "'State='+$t.State;'LastRun='+$i.LastRunTime;'LastResult='+$i.LastTaskResult;"
-           "'NextRun='+$i.NextRunTime}else{'NOT_INSTALLED'}" % (TASK_NAME, TASK_NAME))
+           "'NextRun='+$i.NextRunTime}else{'NOT_INSTALLED'}" % (name, name))
     code, out = _run_ps(cmd, timeout=40)
     if code != 0 or "NOT_INSTALLED" in out or not out:
-        _task_cache.update(at=now, installed=False, info={})
+        _task_cache[name] = {"at": now, "installed": False, "info": {}}
         return False, {}
     info = {}
     for ln in out.splitlines():
         if "=" in ln:
             k, v = ln.split("=", 1)
             info[k.strip()] = v.strip()
-    _task_cache.update(at=now, installed=True, info=info)
+    _task_cache[name] = {"at": now, "installed": True, "info": info}
     return True, info
 
 
 def task_short_state():
     if sys.platform != "win32":
         return C.w("不支持（非 Windows）", C.DIM)
-    installed, info = task_state()
-    if not installed:
-        return C.w("未安装", C.YELLOW)
-    nxt = info.get("NextRun", "")
-    if nxt and len(nxt) > 16:
-        nxt = nxt[:16]
-    return C.w("已安装", C.GREEN) + C.w("（下次 %s）" % nxt if nxt else "", C.DIM)
+    ok_ck, _ = task_state(name=TASK_NAME)
+    ok_gr, _ = task_state(name=GREET_TASK_NAME)
+    if ok_ck and ok_gr:
+        return C.w("已安装", C.GREEN) + C.w("（签到 + 问候）", C.DIM)
+    if ok_ck:
+        return C.w("仅签到", C.YELLOW) + C.w("（问候未装）", C.DIM)
+    if ok_gr:
+        return C.w("仅问候", C.YELLOW) + C.w("（签到未装）", C.DIM)
+    return C.w("未安装", C.YELLOW)
 
 
 def act_task_install():
     cur = core.load_config()["settings"].get("task_time", "09:00")
-    t = ask("  每日执行时间（HH:MM，24 小时制）", cur)
+    t = ask("  每日签到执行时间（HH:MM，24 小时制）", cur)
     try:
         datetime.strptime(str(t), "%H:%M")
     except ValueError:
@@ -413,66 +466,96 @@ def act_task_install():
     if not os.path.isfile(ps1):
         print(C.w("  未找到 install_task.ps1。", C.RED))
         return
-    was_installed, _ = task_state(force=True)
-    print(C.w("  正在%s计划任务（当前用户上下文，无需管理员）…"
-              % ("更新" if was_installed else "注册"), C.DIM))
-    code, _ = _run_ps("& '%s' -Time '%s'" % (ps1, t), timeout=120)
-    installed, info = task_state(force=True)
-    if code == 0 and installed:
+    print(C.w("  将安装两个任务：", C.DIM))
+    print("    · %s —— 每日 %s 跑完整流程" % (TASK_NAME, t))
+    print("    · %s —— 每日 %s-%s 每 %d 分钟轮询，到随机时刻发问候"
+          % (GREET_TASK_NAME, core.GREET_WINDOW[0], core.GREET_WINDOW[1],
+             core.GREET_POLL_MINUTES))
+    print(C.w("  正在注册（当前用户上下文，无需管理员）…", C.DIM))
+    code, _ = _run_ps("& '%s' -Time '%s'" % (ps1, t), timeout=150)
+    ok_ck, i_ck = task_state(force=True, name=TASK_NAME)
+    ok_gr, i_gr = task_state(force=True, name=GREET_TASK_NAME)
+    if code == 0 and (ok_ck or ok_gr):
         core.set_setting(core.load_config(), "task_time", str(t))
-        print(C.w("  ✓ 已%s定时任务：每日 %s 自动签到（无需 WorkBuddy 运行）"
-                  % ("更新" if was_installed else "安装", t), C.GREEN))
-        print("    下次执行：%s" % info.get("NextRun", "-"))
+        if ok_ck:
+            print(C.w("  ✓ 签到任务：每日 %s（下次 %s）"
+                      % (t, i_ck.get("NextRun", "-")), C.GREEN))
+        if ok_gr:
+            print(C.w("  ✓ 问候任务：%s-%s 每 %d 分钟轮询（下次 %s）"
+                      % (core.GREET_WINDOW[0], core.GREET_WINDOW[1],
+                         core.GREET_POLL_MINUTES, i_gr.get("NextRun", "-")), C.GREEN))
+        print(C.w("    提示：本机常在 08:14 之后才开机，窗口内多半赶不上；"
+                  "签到任务会按 greet_catchup 自动补发。", C.DIM))
     else:
         print(C.w("  ✗ 注册失败（退出码 %s）。可手动执行：" % code, C.RED))
         print("    powershell -ExecutionPolicy Bypass -File \"%s\" -Time %s" % (ps1, t))
 
 
 def act_task_uninstall():
-    ps1 = os.path.join(HERE, "install_task.ps1")
-    if not confirm("  确认卸载定时任务 %s？" % TASK_NAME):
+    if not confirm("  确认卸载定时任务 %s 与 %s？" % (TASK_NAME, GREET_TASK_NAME)):
         print(C.w("  已取消。", C.DIM))
         return
+    ps1 = os.path.join(HERE, "install_task.ps1")
     code, _ = _run_ps("& '%s' -Uninstall" % ps1, timeout=90)
-    installed, _info = task_state(force=True)
-    if not installed:
-        print(C.w("  ✓ 定时任务已卸载。", C.GREEN))
+    ok_ck, _ = task_state(force=True, name=TASK_NAME)
+    ok_gr, _ = task_state(force=True, name=GREET_TASK_NAME)
+    if not ok_ck and not ok_gr:
+        print(C.w("  ✓ 定时任务已全部卸载。", C.GREEN))
     else:
-        print(C.w("  ✗ 卸载失败（退出码 %s）。" % code, C.RED))
+        print(C.w("  ✗ 卸载失败（退出码 %s）：签到=%s 问候=%s"
+                  % (code, ok_ck, ok_gr), C.RED))
 
 
 def act_task_status():
     if sys.platform != "win32":
         print(C.w("  定时任务功能仅支持 Windows。其它系统可用 cron 调用脚本。", C.YELLOW))
         return
-    installed, info = task_state(force=True)
-    if not installed:
-        print(C.w("  未安装定时任务。可在「8 → 1」安装。", C.YELLOW))
+    ok_ck, i_ck = task_state(force=True, name=TASK_NAME)
+    ok_gr, i_gr = task_state(force=True, name=GREET_TASK_NAME)
+    if not ok_ck and not ok_gr:
+        print(C.w("  未安装定时任务。可在「9 → 1」安装。", C.YELLOW))
         return
-    print("  任务名    ：%s" % TASK_NAME)
-    print("  状态      ：%s" % C.w(info.get("State", "-"), C.GREEN))
-    print("  上次执行  ：%s" % info.get("LastRun", "-"))
-    print("  上次结果  ：%s%s"
-          % (info.get("LastResult", "-"),
-             C.w("  （0 = 成功）", C.DIM)))
-    print("  下次执行  ：%s" % info.get("NextRun", "-"))
+    for label, ok, info in (("签到任务 ", ok_ck, i_ck), ("问候任务 ", ok_gr, i_gr)):
+        if not ok:
+            print("  %s：%s" % (label, C.w("未安装", C.YELLOW)))
+            continue
+        print("  %s：%s" % (label, C.w(info.get("State", "-"), C.GREEN)))
+        print("      上次执行：%s ｜ 结果 %s%s"
+              % (info.get("LastRun", "-"), info.get("LastResult", "-"),
+                 C.w("（0 = 成功）", C.DIM)))
+        print("      下次执行：%s" % info.get("NextRun", "-"))
+    print("  %s" % C.w("问候任务在 %s-%s 每 %d 分钟触发一次；不到当天随机时刻会静默跳过。"
+                      % (core.GREET_WINDOW[0], core.GREET_WINDOW[1],
+                         core.GREET_POLL_MINUTES), C.DIM))
 
 
 def act_task_run_now():
     if sys.platform != "win32":
         print(C.w("  定时任务功能仅支持 Windows。", C.YELLOW))
         return
-    installed, _ = task_state(force=True)
-    if not installed:
+    ok_ck, _ = task_state(force=True, name=TASK_NAME)
+    ok_gr, _ = task_state(force=True, name=GREET_TASK_NAME)
+    if not ok_ck and not ok_gr:
         print(C.w("  尚未安装定时任务，请先安装。", C.YELLOW))
         return
-    print(C.w("  正在触发一次试跑…", C.DIM))
-    _run_ps("Start-ScheduledTask -TaskName '%s'" % TASK_NAME, timeout=40)
+    which = ask("  试跑哪个？1=签到任务  2=问候任务", "1").strip()
+    name = GREET_TASK_NAME if which == "2" else TASK_NAME
+    print(C.w("  正在触发 %s…" % name, C.DIM))
+    _run_ps("Start-ScheduledTask -TaskName '%s'" % name, timeout=40)
     wait = ask_int("  等待多少秒后查看结果", 10, 3, 120)
     time.sleep(wait)
-    _installed, info = task_state(force=True)
+    _ok, info = task_state(force=True, name=name)
     print("  上次结果：%s" % info.get("LastResult", "-"))
-    act_last_result(show_header=False)
+    if name == GREET_TASK_NAME:
+        trace = os.path.join(core.LOG_DIR, "greet_trace.log")
+        if os.path.isfile(trace):
+            print(C.w("  问候轮询留痕（最后 3 行）：", C.DIM))
+            with open(trace, encoding="utf-8", errors="replace") as f:
+                for ln in f.read().splitlines()[-3:]:
+                    print("    %s" % ln)
+        print(C.w("  说明：问候任务不到随机时刻会静默跳过，这里看到「跳过」是正常的。", C.DIM))
+    else:
+        act_last_result(show_header=False)
 
 
 # --- 日志 ---
@@ -563,6 +646,36 @@ def act_settings_location():
     print(C.w("  ✓ %s 的派遣地点：%s" % (acc.get("label"), LOCATION_NAMES.get(loc, "随机")), C.GREEN))
 
 
+def act_settings_greet_catchup():
+    cfg = core.load_config()
+    cur = bool(cfg["settings"].get("greet_catchup", True))
+    print()
+    print("  当前：%s" % C.w("开启" if cur else "关闭", C.GREEN if cur else C.YELLOW))
+    print("  %s" % C.w("开启 = 错过 %s-%s 窗口后，在之后第一次运行时补发问候；"
+                      % (core.GREET_WINDOW[0], core.GREET_WINDOW[1]), C.DIM))
+    print("  %s" % C.w("关闭 = 只在窗口内发送，错过就当天不发。", C.DIM))
+    print("  %s" % C.w("本机常在 08:14 之后才开机，建议保持开启。", C.DIM))
+    if confirm("  切换为「%s」？" % ("关闭" if cur else "开启")):
+        core.set_setting(cfg, "greet_catchup", not cur)
+        print(C.w("  ✓ 已设置为：%s" % ("关闭" if cur else "开启"), C.GREEN))
+
+
+def act_settings_greet_model():
+    cfg = core.load_config()
+    cur = cfg["settings"].get("greet_model") or core.GREET_DEFAULT_MODEL
+    print()
+    print("  当前模型：%s" % C.w(cur, C.GREEN))
+    print("  %s" % C.w("候选：%s" % "，".join(core.GREET_MODEL_CANDIDATES), C.DIM))
+    m = ask("  输入模型名", cur).strip()
+    if not m:
+        print(C.w("  已取消。", C.DIM))
+        return
+    core.set_setting(cfg, "greet_model", m)
+    print(C.w("  ✓ 问候模型已设为：%s" % m, C.GREEN))
+    if m not in core.GREET_MODEL_CANDIDATES:
+        print(C.w("    注意：该模型未经实测，若发送失败可改回 hy3。", C.YELLOW))
+
+
 def act_diagnose():
     print()
     core.cmd_diagnose(argparse.Namespace(json=False, capture_dir=None))
@@ -573,9 +686,15 @@ def act_help():
   %s
 
   · 首次使用：进「账号管理 → 从本机登录态提取」，一次性把本机登录过的账号全抓进来。
-  · 日常使用：直接用「1」一键签到 + 派小猫 + 活跃自检；想定时自动跑就装「8 → 1」定时任务。
+  · 日常使用：直接用「1」一键签到 + 派小猫 + 活跃自检 + 问候；
+    想定时自动跑就装「9 → 1」定时任务（会同时装签到任务与问候任务）。
   · 只想看今天有没有点亮活跃（会不会断连登）：选「5」，全程只读。
-  · Token 有效期约 30 天，到期前一周菜单顶部会提示；届时登录一次客户端再「7 → 1」即可。
+  · 签到 ≠ 连登：签到走 /billing/meter/daily-checkin 发积分；连登走活跃地图，
+    口径是「当天完成一次有效对话」。所以只签到保不住连登 —— 这才需要每日问候。
+  · 每日问候：默认 03:00-08:00 之间随机一个时刻，每个账号发一条随机语言的问候
+    （汉语/英语/俄语/法语/意大利语/德语），用 hy3 模型。菜单「6」里有全部操作。
+  · 不想让它自动发消息：命令行加 --no-greet；只想去掉「错过补发」则进「12 → 4」。
+  · Token 有效期约 30 天，到期前一周菜单顶部会提示；届时登录一次客户端再「8 → 1」即可。
   · 计划任务与本菜单互不影响：任务跑的是无参数模式，不会弹出交互界面。
 
   %s
@@ -637,9 +756,15 @@ def main():
         ("5", "删除账号", act_remove_account),
         ("6", "查看账号列表", lambda: print_accounts()),
     ])
+    sub_greet = submenu("每日问候（6 种语言 × 随机时刻）", [
+        ("1", "立即强制发一条（忽略窗口与「当天已发」）", act_greet_force),
+        ("2", "查看今天发了没 / 详细状态", act_greet_status),
+        ("3", "预览随机效果（只演示，不发送）", act_greet_preview),
+        ("4", "重置今日状态（重新抽随机时刻）", act_greet_reset),
+    ])
     sub_task = submenu("定时任务（Windows 计划任务，独立于 WorkBuddy）", [
-        ("1", "安装 / 修改每日自动签到时间", act_task_install),
-        ("2", "卸载定时任务", act_task_uninstall),
+        ("1", "安装 / 修改定时任务（签到任务 + 问候任务）", act_task_install),
+        ("2", "卸载全部定时任务", act_task_uninstall),
         ("3", "查看任务状态", act_task_status),
         ("4", "立即试跑一次", act_task_run_now),
     ])
@@ -647,21 +772,24 @@ def main():
         ("1", "并发线程数", act_settings_concurrency),
         ("2", "切换桌面通知", act_settings_notify),
         ("3", "设置某账号的派遣地点", act_settings_location),
+        ("4", "切换问候「错过窗口后补发」", act_settings_greet_catchup),
+        ("5", "设置问候模型（默认 hy3）", act_settings_greet_model),
     ])
     items = [
-        ("1", "立即签到 + 派小猫 + 活跃自检（全部启用账号）", act_run_full),
+        ("1", "立即签到 + 派小猫 + 活跃自检 + 每日问候（全部启用账号）", act_run_full),
         ("2", "只签到（不派小猫）", act_run_checkin_only),
         ("3", "只派小猫旅行", act_run_travel_only),
         ("4", "只查询状态（只读，不领取）", act_run_status_only),
         ("5", "只做活跃自检（连登中断预警，只读）", act_run_activity_only),
-        ("6", "选择账号执行…", act_run_selected),
-        ("7", "账号管理…", sub_accounts),
-        ("8", "定时任务…（每日自动签到）", sub_task),
-        ("9", "查看账号与 Token 有效期", lambda: print_accounts()),
-        ("10", "查看最近一次运行结果 / 日志", act_last_result),
-        ("11", "设置…（并发 / 桌面通知 / 派遣地点）", sub_settings),
-        ("12", "环境自检", act_diagnose),
-        ("13", "使用帮助", act_help),
+        ("6", "每日问候…（随机语言，默认 03:00-08:00 自动发）", sub_greet),
+        ("7", "选择账号执行…", act_run_selected),
+        ("8", "账号管理…", sub_accounts),
+        ("9", "定时任务…（每日自动签到 + 问候）", sub_task),
+        ("10", "查看账号与 Token 有效期", lambda: print_accounts()),
+        ("11", "查看最近一次运行结果 / 日志", act_last_result),
+        ("12", "设置…（并发 / 通知 / 派遣地点 / 问候）", sub_settings),
+        ("13", "环境自检", act_diagnose),
+        ("14", "使用帮助", act_help),
     ]
     menu("主菜单", items, back_key="0", back_label="退出")
     print(C.w("\n  已退出。\n", C.DIM))
