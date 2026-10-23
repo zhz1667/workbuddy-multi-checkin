@@ -139,7 +139,7 @@ if sys.version_info < (3, 6):
     sys.stderr.write("需要 Python 3.6+，当前 %s\n" % sys.version.split()[0])
     sys.exit(2)
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 
 # ---------------- 路径与常量 ----------------
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -320,6 +320,82 @@ def fmt_duration(seconds):
     return "%d 分钟" % m
 
 
+# ---------------- Token 自动续期 / 临期告警（v1.0.5） ----------------
+# 背景（2026-10-23 真实事故）：Token 有效期 30 天，到期后**定时任务静默失败**
+# （CSV 记 token_expired、退出码 1），且在失败后才弹一次桌面通知，很容易错过。
+# 本机 %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth 下通常存有多份明文
+# accessToken（含其他账号、有效期更长），因此运行前可按 uid 自动续期。
+TOKEN_REFRESH_AHEAD_DAYS = 3      # 剩余 <= 该天数即视为「临期」，运行前自动尝试续期
+TOKEN_WARN_DAYS = 7               # 剩余 <= 该天数即在报告与桌面通知里告警
+
+
+def token_left_days(token):
+    """Token 剩余天数（float）；无法解析 exp 时返回 None。"""
+    ok, left, _ = token_status(token)
+    return None if left is None else left / 86400.0
+
+
+def auto_refresh_tokens(cfg, accounts, ahead_days=TOKEN_REFRESH_AHEAD_DAYS):
+    """按 uid 从本机登录态，为「已过期 / 临期」的账号续期。
+
+    约束：
+      · 只改 token，**不动 domain**（域名由用户/历史决定，不由登录态覆盖）；
+      · 只接受比现有 Token 更晚到期的候选，绝不把有效的换成更短的；
+      · 捞不到就保持原样、不报错——后续流程仍会按原 Token 尝试，失败照常记 token_expired。
+    返回 {"refreshed": [(label, 旧到期, 新到期)], "missing": [label], "scanned": n}
+    """
+    out = {"refreshed": [], "missing": [], "scanned": 0}
+    need = []
+    for acc in accounts:
+        d = token_left_days(acc.get("token") or "")
+        if d is not None and d <= ahead_days:
+            need.append(acc)
+    if not need:
+        return out
+    try:
+        found, stats = scan_auth_files(None)
+    except Exception:  # noqa: BLE001
+        return out
+    out["scanned"] = stats.get("files", 0)
+
+    best = {}
+    for rec in found:
+        uid = str(rec.get("uid") or "")
+        if not uid or not rec.get("valid"):
+            continue
+        cur = best.get(uid)
+        if cur is None or (rec.get("left") or 0) > (cur.get("left") or 0):
+            best[uid] = rec
+
+    for acc in need:
+        rec = best.get(str(acc.get("uid") or ""))
+        if not rec:
+            out["missing"].append(acc.get("label"))
+            continue
+        old_left = token_left_days(acc.get("token") or "") or 0
+        # 注意单位：rec["left"] 是秒，old_left 是天，必须换算后再比，否则「不降级」失效
+        new_left = (rec.get("left") or 0) / 86400.0
+        if new_left <= old_left:
+            out["missing"].append(acc.get("label"))
+            continue
+        acc["token"] = rec["token"]
+        acc["updated_at"] = now_str()
+        acc["source"] = "auto-refresh"
+        old_txt = "已过期" if old_left <= 0 else fmt_duration(int(old_left * 86400))
+        out["refreshed"].append((acc.get("label"), old_txt, rec.get("exp_str")))
+    return out
+
+
+def token_expiring(accounts, warn_days=TOKEN_WARN_DAYS):
+    """返回 [(label, 剩余天数)]，剩余 <= warn_days；已过期时天数为负或 0。"""
+    out = []
+    for acc in accounts:
+        d = token_left_days(acc.get("token") or "")
+        if d is not None and d <= warn_days:
+            out.append((acc.get("label"), d))
+    return out
+
+
 # ---------------- 配置读写 ----------------
 DEFAULT_CONFIG = {
     "version": 1,
@@ -331,6 +407,9 @@ DEFAULT_CONFIG = {
         # 每日问候（v1.0.3）：窗口内没赶上时是否补发；用哪个模型
         "greet_catchup": True,
         "greet_model": GREET_DEFAULT_MODEL,
+        # Token 自动续期（v1.0.5）：运行前对「已过期 / 临期 ≤3 天」的账号，
+        # 按 uid 从本机登录态取更晚到期的 Token。设为 false 则只告警不自动换。
+        "token_auto_refresh": True,
     },
     "accounts": [],
 }
@@ -1515,6 +1594,20 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
     if not greet_model:
         greet_model = settings.get("greet_model") or GREET_DEFAULT_MODEL
 
+    # v1.0.5：运行前自动为「已过期 / 临期」账号续期（settings.token_auto_refresh 可关）
+    if bool(settings.get("token_auto_refresh", True)):
+        try:
+            rr = auto_refresh_tokens(cfg, accounts)
+        except Exception:  # noqa: BLE001
+            rr = {"refreshed": []}
+        if rr.get("refreshed"):
+            save_config(cfg)
+            if not as_json:
+                for label, old_exp, new_exp in rr["refreshed"]:
+                    print("Token 自动续期：%s（原到期 %s → 新到期 %s，取自本机登录态）"
+                          % (label, old_exp, new_exp))
+    expiring = token_expiring(accounts)
+
     gp = None
     if greet_mode != "off":
         gp = greet_plan(accounts, catchup=greet_catchup, force=greet_force,
@@ -1576,6 +1669,16 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
                           "results": results}, ensure_ascii=False, indent=2))
     else:
         print_report(results, elapsed, do_check, check_only, travel_mode, gp)
+        if expiring:
+            dead = [(l, d) for l, d in expiring if d <= 0]
+            soon = [(l, d) for l, d in expiring if d > 0]
+            if dead:
+                print("⚠ Token 已过期：%s" % "，".join(l for l, _ in dead))
+            if soon:
+                print("⚠ Token 临期：%s" % "，".join(
+                    "%s 剩 %d 天" % (l, max(1, int(d))) for l, d in soon))
+            print("  处理：登录该账号后运行 --capture（菜单 8 → 1）刷新；"
+                  "每次运行前也会自动尝试从本机登录态续期。")
         print("日志：%s" % LOG_DIR)
 
     # 连登风险：有账号当天未点亮活跃（即便签到成功，连登仍有断档风险）
@@ -1621,6 +1724,20 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
                 str(r.get("label")) for r in risk)
         if bad:
             body += " ｜ 失败 %d：%s" % (len(bad), "，".join(str(b.get("label")) for b in bad))
+        if expiring:
+            # 凭证问题优先级最高：Token 一旦失效，后面所有任务都会静默失败
+            dead = [(l, d) for l, d in expiring if d <= 0]
+            soon = [(l, d) for l, d in expiring if d > 0]
+            if dead:
+                title = "WorkBuddy 凭证失效：%s 的 Token 已过期" % dead[0][0]
+                body += " ｜ ⚠ Token 已过期：%s" % "，".join(l for l, _ in dead)
+            if soon:
+                near = sorted(soon, key=lambda x: x[1])[0]
+                if not dead:
+                    title = "WorkBuddy 凭证临期：%s 的 Token 剩 %d 天" % (
+                        near[0], max(1, int(near[1])))
+                body += " ｜ ⚠ Token 临期：%s（--capture 可续期）" % "，".join(
+                    "%s 剩 %d 天" % (l, max(1, int(d))) for l, d in soon)
         desktop_toast(title, body)
 
     return results, elapsed, (0 if all(r["status"] == "ok" for r in results) else 1)

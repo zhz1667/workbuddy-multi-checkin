@@ -4,7 +4,8 @@
     "domains": ["www.workbuddy.cn", "www.codebuddy.cn"],
     "concurrency": 4,
     "travel_default": true,
-    "desktop_notify": true
+    "desktop_notify": true,
+    "token_auto_refresh": true
   },
   "accounts": [
     {

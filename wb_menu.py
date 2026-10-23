@@ -141,7 +141,10 @@ def header():
              task_short_state()))
     if accounts:
         if warn:
-            print("  Token：%s" % C.w("有 %d 项需处理（过期 / 临近过期）" % warn, C.YELLOW))
+            auto = bool(cfg["settings"].get("token_auto_refresh", True))
+            print("  Token：%s" % C.w("有 %d 项需处理（过期 / 临近过期）%s"
+                                     % (warn, "，运行前会自动尝试从本机登录态续期" if auto else ""),
+                                     C.YELLOW))
         else:
             print("  Token：%s" % C.w("全部正常", C.GREEN))
     else:
@@ -619,6 +622,23 @@ def act_settings_notify():
     print(C.w("  ✓ 桌面通知已%s" % ("关闭" if cur else "开启"), C.GREEN))
 
 
+def act_settings_token_refresh():
+    cfg = core.load_config()
+    cur = bool(cfg["settings"].get("token_auto_refresh", True))
+    print()
+    print("  当前：%s" % C.w("开启" if cur else "关闭", C.GREEN if cur else C.YELLOW))
+    print("  %s" % C.w("开启 = 每次运行前，对「已过期 / 剩余 <= %d 天」的账号，"
+                      "自动从本机登录态按 uid 取更晚到期的 Token。" % core.TOKEN_REFRESH_AHEAD_DAYS,
+                      C.DIM))
+    print("  %s" % C.w("       只换 Token，不改域名；捞不到或更短就保持原样，不会把你降级。", C.DIM))
+    print("  %s" % C.w("关闭 = 只告警不自动换（Token 到期后定时任务会静默失败）。", C.DIM))
+    print("  %s" % C.w("剩余 <= %d 天仍会在报告与桌面通知里提醒，不受此开关影响。"
+                      % (core.TOKEN_WARN_DAYS, ), C.DIM))
+    if confirm("  切换为「%s」？" % ("关闭" if cur else "开启")):
+        core.set_setting(cfg, "token_auto_refresh", not cur)
+        print(C.w("  ✓ 已设置为：%s" % ("关闭" if cur else "开启"), C.GREEN))
+
+
 def act_settings_location():
     cfg = core.load_config()
     if not cfg["accounts"]:
@@ -695,7 +715,10 @@ def act_help():
   · 每日问候：默认 03:00-08:00 之间随机一个时刻，每个账号发一条随机语言的问候
     （汉语/英语/俄语/法语/意大利语/德语），用 hy3 模型。菜单「6」里有全部操作。
   · 不想让它自动发消息：命令行加 --no-greet；只想去掉「错过补发」则进「12 → 4」。
-  · Token 有效期约 30 天，到期前一周菜单顶部会提示；届时登录一次客户端再「8 → 1」即可。
+  · Token 有效期约 30 天。v1.0.5 起：每次运行前会自动为「已过期 / 剩余 <= 3 天」
+    的账号，从本机登录态按 uid 换成更晚到期的 Token（只换 Token 不改域名）；
+    剩余 <= 7 天就会在报告与桌面通知里提醒。彻底失效时登录一次客户端再「8 → 1」。
+    该自动行为可在「12 → 6」关闭。
   · 计划任务与本菜单互不影响：任务跑的是无参数模式，不会弹出交互界面。
 
   %s
@@ -775,6 +798,7 @@ def main():
         ("3", "设置某账号的派遣地点", act_settings_location),
         ("4", "切换问候「错过窗口后补发」", act_settings_greet_catchup),
         ("5", "设置问候模型（默认 hy3）", act_settings_greet_model),
+        ("6", "切换 Token 自动续期（默认开）", act_settings_token_refresh),
     ])
     items = [
         ("1", "立即签到 + 派小猫 + 活跃自检 + 每日问候（全部启用账号）", act_run_full),
@@ -788,7 +812,7 @@ def main():
         ("9", "定时任务…（每日自动签到 + 问候）", sub_task),
         ("10", "查看账号与 Token 有效期", lambda: print_accounts()),
         ("11", "查看最近一次运行结果 / 日志", act_last_result),
-        ("12", "设置…（并发 / 通知 / 派遣地点 / 问候）", sub_settings),
+        ("12", "设置…（并发 / 通知 / 派遣地点 / 问候 / Token 续期）", sub_settings),
         ("13", "环境自检", act_diagnose),
         ("14", "使用帮助", act_help),
     ]
