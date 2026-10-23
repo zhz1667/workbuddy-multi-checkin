@@ -46,9 +46,29 @@ Token 从哪来（一次性准备，之后长期独立运行）：
 
 退出码：全部账号成功/已签 0；存在失败 1；配置错误 2。
 
+v1.0.4（2026-10-04）—— 修正活跃自检的「误报」与误导性文案：
+  - **踩到的坑**：服务端 /activity/growth/heatmap 会返回**明显过期的快照**（实测某次
+    updated_at 停在约 18 小时前），此时读到的「未点亮 / 活跃分 0 / 连登 N 天」全是老数据，
+    但 v1.0.2/1.0.3 会据此报「⚠ 连登预警」，属**误报**。同一分钟内两次读取结果不同即为铁证。
+  - **修法**：check_activity() 现在会
+      ① 计算快照年龄（updated_at → 本地时间），fresh 即返回；
+      ② 年龄 >= 120 分钟，或**已过每日 02:00 结算时刻但快照日期仍是昨天**，判为滞后，
+         间隔 8 秒重读，最多再读 2 次，取最新的一份；
+      ③ 结果里返回 stale / snapshot_age_min / heatmap_reads / refreshed；
+      ④ 报告里滞后时打印「ⓘ 快照滞后 … — 今日状态暂不可信，不做预警」，
+         **不再**计入连登风险、不再弹「未点亮」预警。
+  - **文案改正**：原「今日【未点亮】— 需完成一次有效对话才会被记录」容易读成「任务没完成」，
+    改为中性的「今日尚未点亮（活跃分 N；热力墙每日 02:00 结算，客户端对话后次日复查）」。
+  - **重要口径更正（2026-10-04 实测）**：
+      · 成长中心前端明示「热力墙数据**每日凌晨 02:00 更新**」→ 当天查当天永远不准。
+      · 桌面客户端登录的是**单一账号**（可由 ~/.workbuddy/<user-id> 目录反推）。对照发现：
+        纯脚本账号的活跃分与「只签到」基线基本相同，而客户端真实使用日可达 46~66 分。
+        → **问候走裸 HTTP 接口，是否计入活跃分存疑**（本机 3 天数据里没有稳定增量），
+          故 v1.0.4 起不再宣称「问候能点亮活跃」。详见 logs/greet-diagnosis-2026-10-04.md。
+
 v1.0.3（2026-10-01）—— 新增每日问候（可关闭）：
-  - **为什么需要**：连登 = 活跃地图的连续活跃天数，口径是「当天完成一次有效对话」。
-    只签到保不住连登，所以增加「每天发一条问候」来点亮活跃。
+  - **为什么需要**：连登 = 活跃地图的连续活跃天数，要求当天有真实使用。
+    只签到保不住连登，所以增加「每天发一条问候」尝试点亮活跃（效果存疑，见 v1.0.4）。
   - **怎么做**：POST https://<domain>/v2/chat/completions，body 形如
     {"model":"hy3","messages":[{"role":"user","content":"<问候语>"}],"stream":true}。
     **必须 stream=true** —— 服务端对非流式请求直接回 400（code 11101
@@ -69,8 +89,8 @@ v1.0.3（2026-10-01）—— 新增每日问候（可关闭）：
 v1.0.2（2026-09-30）—— 新增活跃自检（连登预警）：
   - 「签到」与「连登」是**两套独立机制**：
       · 签到（/v2/billing/meter/daily-checkin）→ 发 Credits，本工具已覆盖；
-      · 连登（/v2/activity/growth/streak）= **活跃地图的连续活跃天数**，口径为
-        「当天需完成一次有效对话」，数据每日 02:00 聚合，**与签到无关**。
+      · 连登（/v2/activity/growth/streak）= **活跃地图的连续活跃天数**，要求当天有使用，
+        数据每日 02:00 结算，**与签到无关**。
     所以只签到并不能保住连登：某天完全没用 WorkBuddy，连登就会断。
   - 新增只读自检：GET /v2/activity/growth/heatmap 取 data.today.{score,is_active}，
     GET /v2/activity/growth/streak 取连登天数与补登卡余额，逐账号打印并写入日志/CSV；
@@ -119,7 +139,7 @@ if sys.version_info < (3, 6):
     sys.stderr.write("需要 Python 3.6+，当前 %s\n" % sys.version.split()[0])
     sys.exit(2)
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 # ---------------- 路径与常量 ----------------
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -145,6 +165,15 @@ GROWTH_STREAK_PATH = "/activity/growth/streak"
 
 # 活跃分分档（前端配色函数：score<=0 无记录；<=10 / <=30 / <=60 / >60 共 4 档）
 ACTIVITY_SCORE_BANDS = ((0, "未点亮"), (10, "微亮"), (30, "常亮"), (60, "高亮"), (None, "炽热"))
+
+# 活跃地图快照的「结算/一致性」口径（v1.0.4）
+#   · 成长中心前端明示：「热力墙数据每日凌晨 02:00 更新」——当天状态当天查不准是正常的。
+#   · 服务端还会返回**明显过期的快照**（实测 updated_at 曾落后约 18 小时），
+#     此时把「未点亮」当事实会误报「连登预警」，所以必须重读并标注数据是否滞后。
+ACTIVITY_AGG_HOUR = 2            # 热力墙每日结算时刻（小时）
+ACTIVITY_STALE_MINUTES = 120     # 快照年龄超过该值即判为「明显滞后」
+ACTIVITY_RETRY_TIMES = 2         # 判为滞后后最多再重读几次
+ACTIVITY_RETRY_WAIT = 8          # 重读间隔（秒）
 
 # ---------------- 每日问候（v1.0.3） ----------------
 # POST https://<domain>/v2/chat/completions
@@ -723,21 +752,70 @@ def growth_get(token, path):
     return None
 
 
+def _parse_iso_dt(s):
+    """解析服务端 ISO8601 时间（形如 2026-10-04T09:23:20+08:00）；失败返回 None。"""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(s).strip().replace("Z", "+00:00"))
+    except Exception:  # noqa: BLE001
+        return None
+    if dt.tzinfo is not None:                    # 统一换算成本地时间再去掉时区
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def _snapshot_age_min(updated_at, now=None):
+    """快照年龄（分钟，float）；无法解析时返回 None。"""
+    dt = _parse_iso_dt(updated_at)
+    if dt is None:
+        return None
+    return ((now or datetime.now()) - dt).total_seconds() / 60.0
+
+
+def _human_age(minutes):
+    """把分钟数说成人话：'约 13 分钟' / '约 18.3 小时'。"""
+    if minutes is None:
+        return "未知"
+    if minutes < 90:
+        return "约 %d 分钟" % round(minutes)
+    return "约 %.1f 小时" % (minutes / 60.0)
+
+
 def check_activity(token):
     """只读活跃自检：活跃地图 + 连登。
 
-    口径（来自成长计划页内置文案，勿臆测）：
-      · 「活跃口径：需完成一次有效对话才能被记录至活跃地图。」
-      · 活跃地图数据「每日 02:00」聚合；当天 score>0 即 is_active。
-      · 连登（streak）就是活跃地图的连续活跃天数，与签到无关。
+    口径（来自成长计划页内置文案与前端提示，勿臆测）：
+      · 成长中心前端明示「热力墙数据每日凌晨 02:00 更新」，当天状态当天查不准属正常。
+      · 服务端会返回明显过期的快照（实测 updated_at 曾落后约 18 小时）。此时**不能**
+        把「未点亮」当成事实，本函数会重读几次，并用 `stale` 标注数据是否可信。
+      · 连登（streak）是活跃地图的连续活跃天数，与签到无关。
 
     **只读**：不代发对话、不调用任何模型接口。返回结果片段，供报告/日志使用。
     """
     out = {"ok": False, "today": None, "score": None, "active": None, "band": "",
            "status_text": "", "updated_at": "", "streak_days": None,
-           "next_tier": "", "makeup_cards": None, "msg": "", "detail": {}}
+           "next_tier": "", "makeup_cards": None, "msg": "", "detail": {},
+           "stale": False, "snapshot_age_min": None,
+           "heatmap_reads": 0, "refreshed": False}
 
-    hm = growth_get(token, GROWTH_HEATMAP_PATH)
+    now = datetime.now()
+    hm, best_age, reads = None, None, 0
+    for attempt in range(ACTIVITY_RETRY_TIMES + 1):
+        cand = growth_get(token, GROWTH_HEATMAP_PATH)
+        if cand is not None:
+            reads += 1
+            age = _snapshot_age_min(cand.get("updated_at"), now)
+            if hm is None or (age is not None and (best_age is None or age < best_age)):
+                hm, best_age = cand, age
+            if age is not None and age < ACTIVITY_STALE_MINUTES:
+                break                            # 拿到新鲜快照，不必再读
+        if attempt < ACTIVITY_RETRY_TIMES:
+            time.sleep(ACTIVITY_RETRY_WAIT)
+    out["heatmap_reads"] = reads
+    out["refreshed"] = bool(reads > 1 and best_age is not None
+                            and best_age < ACTIVITY_STALE_MINUTES)
+
     if hm is None:
         out["msg"] = "活跃地图接口不可用（Token 失效或网络异常）"
         return out
@@ -752,11 +830,27 @@ def check_activity(token):
     out["status_text"] = today.get("status_text") or ""
     out["updated_at"] = hm.get("updated_at") or ""
     out["band"] = _score_band(out["score"])
+
+    # —— 快照可信度判定 ——
+    out["snapshot_age_min"] = None if best_age is None else round(best_age, 1)
+    stale = False
+    if best_age is not None:
+        stale = best_age >= ACTIVITY_STALE_MINUTES
+        # 已过每日结算时刻，快照日期却还是昨天 → 同样判为滞后
+        if not stale and now.hour >= ACTIVITY_AGG_HOUR:
+            dt = _parse_iso_dt(out["updated_at"])
+            if dt is not None and dt.date() < now.date():
+                stale = True
+    out["stale"] = bool(stale)
+
     out["detail"]["heatmap"] = {
         "today": today,
         "range": hm.get("range"),
         "updated_at": hm.get("updated_at"),
         "cells_total": len(hm.get("cells") or []),
+        "stale": out["stale"],
+        "snapshot_age_min": out["snapshot_age_min"],
+        "reads": reads,
     }
 
     sk_data = growth_get(token, GROWTH_STREAK_PATH)
@@ -768,12 +862,20 @@ def check_activity(token):
         out["makeup_cards"] = sk_data.get("makeup_cards")
 
     out["ok"] = True
-    bits = ["今日已点亮（活跃分 %s · %s）" % (out["score"], out["band"]) if out["active"]
-            else "今日【未点亮】— 需完成一次有效对话才会被记录"]
+    if out["active"]:
+        bits = ["今日已点亮（活跃分 %s · %s）" % (out["score"], out["band"])]
+    elif out["stale"]:
+        bits = ["今日状态待确认（快照 %s，滞后 %s；热力墙每日 02:00 结算）"
+                % (out["updated_at"], _human_age(best_age))]
+    else:
+        bits = ["今日尚未点亮（活跃分 %s；热力墙每日 02:00 结算，客户端对话后次日复查）"
+                % out["score"]]
     if out["streak_days"] is not None:
         bits.append("连登 %s 天" % out["streak_days"])
     if out["next_tier"]:
         bits.append("下一档 %s" % out["next_tier"])
+    if out["stale"]:
+        bits.append("数据可能滞后，已重读 %d 次" % reads)
     out["msg"] = "活跃：" + "，".join(bits)
     return out
 
@@ -1477,9 +1579,10 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
         print("日志：%s" % LOG_DIR)
 
     # 连登风险：有账号当天未点亮活跃（即便签到成功，连登仍有断档风险）
+    # 注意：快照明显滞后时（老数据）不算风险，否则会像 v1.0.3 那样误报预警。
     risk = [r for r in results
             if isinstance(r.get("activity"), dict) and r["activity"].get("ok")
-            and not r["activity"].get("active")]
+            and not r["activity"].get("active") and not r["activity"].get("stale")]
 
     if notify:
         ok = [r for r in results if r["status"] == "ok"]
@@ -1549,8 +1652,14 @@ def print_report(results, elapsed, do_check=True, check_only=False, travel_mode=
                       % ("已点亮" if ac.get("active") else "**未点亮**",
                          ac.get("score"), ac.get("band"), ac.get("streak_days"),
                          " ｜ 更新于 %s" % ac["updated_at"] if ac.get("updated_at") else ""))
-                if not ac.get("active"):
-                    print("          ⚠ 连登有断档风险：请手动发一条消息（或用问候功能自动点亮）")
+                if ac.get("stale"):
+                    print("          ⓘ 快照滞后 %s（热力墙每日 02:00 结算，已重读 %s 次）"
+                          "— 今日状态暂不可信，不做预警"
+                          % (_human_age(ac.get("snapshot_age_min")),
+                             ac.get("heatmap_reads")))
+                elif not ac.get("active"):
+                    print("          ⚠ 连登有断档风险：请在客户端发一条消息"
+                          "（问候走的是裸接口，未必计入活跃）")
         g = r.get("greet") if isinstance(r.get("greet"), dict) else None
         if g:
             if g.get("ok"):
@@ -1634,11 +1743,18 @@ def print_report(results, elapsed, do_check=True, check_only=False, travel_mode=
                            and r["activity"].get("streak_days") is not None) or "-"))
         miss = [r for r in results
                 if isinstance(r.get("activity"), dict) and r["activity"].get("ok")
-                and not r["activity"].get("active")]
+                and not r["activity"].get("active") and not r["activity"].get("stale")]
+        lag = [r for r in results
+               if isinstance(r.get("activity"), dict) and r["activity"].get("ok")
+               and not r["activity"].get("active") and r["activity"].get("stale")]
         if miss:
             print("⚠ 连登预警：以下账号今日未活跃（连登会断档）——%s"
                   % "，".join(str(r.get("label")) for r in miss))
             print("  处理方式：打开 WorkBuddy 任意对话，发一条消息即可点亮（本工具只提醒，不代发）。")
+        if lag:
+            print("ⓘ 以下账号今日状态待确认（活跃地图快照滞后，数据可能不代表今日）——%s"
+                  % "，".join(str(r.get("label")) for r in lag))
+            print("  原因：热力墙每日凌晨 02:00 才结算，服务端快照最长实测滞后约 18 小时。稍后再看即可，非账号异常。")
     if bad:
         print("失败账号：%s" % "，".join("%s(%s)" % (b.get("label"), str(b.get("msg"))[:40]) for b in bad))
     print("=" * 92)
