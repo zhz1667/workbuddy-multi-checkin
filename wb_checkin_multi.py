@@ -126,6 +126,7 @@ import glob
 import json
 import os
 import random
+import re
 import socket
 import subprocess
 import sys
@@ -139,7 +140,7 @@ if sys.version_info < (3, 6):
     sys.stderr.write("需要 Python 3.6+，当前 %s\n" % sys.version.split()[0])
     sys.exit(2)
 
-VERSION = "1.0.5"
+VERSION = "1.0.10"
 
 # ---------------- 路径与常量 ----------------
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -394,6 +395,668 @@ def token_expiring(accounts, warn_days=TOKEN_WARN_DAYS):
         if d is not None and d <= warn_days:
             out.append((acc.get("label"), d))
     return out
+
+
+# ---------------- 浏览器取 Token（v1.0.6） ----------------
+# 背景（2026-10-24）：客户端把登录态改成信封加密（auth.accessToken =
+# {"$wbEncrypted":1,"envelope":...}），明文快照全部作废；官方 Keycloak 的 console
+# 客户端又没开 Direct Access Grant（密码模式返回 unauthorized_client）。
+# 因此改用「网页端登录」这条合法路径：用专属浏览器 profile 登录一次
+# www.workbuddy.cn，之后从该 profile 的本地存储里读出 JWT，**逐个实测**，
+# 只把返回 200 的写进配置 —— 有效与否由服务端判定，而不是看 exp。
+BROWSER_PROFILE_DIR = os.path.join(TOOL_DIR, ".browser-profile")
+BROWSER_LOGIN_URL = "https://www.workbuddy.cn/login"
+BROWSER_EXES = [
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+]
+_JWT_RE = re.compile(rb"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{5,}")
+# 浏览器 profile 里只有少量文件较大（Cache），跳过以免拖慢
+_BROWSER_SKIP_DIRS = ("Cache", "Code Cache", "GPUCache", "DawnGraphiteCache",
+                      "DawnWebGPUCache", "ShaderCache", "GrShaderCache", "Crashpad")
+
+
+def browser_exe():
+    for p in BROWSER_EXES:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def browser_login(profile_dir=None):
+    """用专属 profile 打开登录页（一次性人工登录）。返回 (ok, msg)。"""
+    exe = browser_exe()
+    if not exe:
+        return False, "未找到 Edge/Chrome，请手动打开 %s 登录" % BROWSER_LOGIN_URL
+    # 必须转绝对路径：--user-data-dir 传相对路径时浏览器会按自身工作目录解析，导致配置写不到项目里
+    prof = os.path.abspath(profile_dir or BROWSER_PROFILE_DIR)
+    os.makedirs(prof, exist_ok=True)
+    try:
+        subprocess.Popen([exe, "--user-data-dir=%s" % prof, "--no-first-run",
+                          "--no-default-browser-check", BROWSER_LOGIN_URL])
+    except Exception as e:  # noqa: BLE001
+        return False, "启动浏览器失败：%s" % e
+    return True, prof
+
+
+def _iter_jwts(root):
+    """遍历目录，产出 (token, 相对路径)。只读，不修改任何文件。"""
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in _BROWSER_SKIP_DIRS]
+        for fn in files:
+            p = os.path.join(base, fn)
+            try:
+                if os.path.getsize(p) > 32 * 1024 * 1024:
+                    continue
+                raw = open(p, "rb").read()
+            except Exception:  # noqa: BLE001
+                continue
+            for m in _JWT_RE.findall(raw):
+                yield m.decode("ascii", "ignore"), os.path.relpath(p, root)
+
+
+def browser_profile_dirs(profile_dir=None):
+    """所有可用的浏览器会话目录：指定的那个 + 项目下 .browser-profile* （多账号各一份）。"""
+    dirs = []
+    if profile_dir:
+        p = os.path.abspath(profile_dir)
+        if os.path.isdir(p):
+            dirs.append(p)
+    try:
+        for name in sorted(os.listdir(TOOL_DIR)):
+            if name.startswith(".browser-profile"):
+                p = os.path.join(TOOL_DIR, name)
+                if os.path.isdir(p) and p not in dirs:
+                    dirs.append(p)
+    except Exception:  # noqa: BLE001
+        pass
+    return dirs
+
+
+def browser_candidates(profile_dir=None):
+    """扫 profile，返回去重后的候选 [{uid, token, exp, iat, src}]，按签发时间倒序。"""
+    dirs = browser_profile_dirs(profile_dir)
+    if not dirs:
+        return []
+    seen = {}
+    for prof in dirs:
+        for tok, rel in _iter_jwts(prof):
+            try:
+                payload = tok.split(".")[1]
+                payload += "=" * (-len(payload) % 4)
+                d = json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")).decode("utf-8"))
+            except Exception:  # noqa: BLE001
+                continue
+            iss = str(d.get("iss") or "")
+            # 只认本项目会用到的签发方，避免把别的应用的 Token 当候选
+            if "copilot.tencent.com" not in iss and "workbuddy" not in iss:
+                continue
+            uid = str(d.get("sub") or "")
+            iat = int(d.get("iat") or 0)
+            exp = int(d.get("exp") or 0)
+            if not uid or iat <= 0:
+                continue
+            key = (uid, iat)
+            if key in seen:
+                continue
+            seen[key] = {"uid": uid, "token": tok, "iat": iat, "exp": exp,
+                         "src": "%s/%s" % (os.path.basename(prof), rel)}
+    return sorted(seen.values(), key=lambda r: -r["iat"])
+
+
+def verify_token(token, domains=None):
+    """实测一个 Token 能否调通只读接口。返回 (可用域名 或 None)。"""
+    cand = list(domains or []) + DEFAULT_DOMAINS
+    tried = []
+    for dom in cand:
+        if not dom or dom in tried:
+            continue
+        tried.append(dom)
+        try:
+            st, body = api_call("https://%s/v2" % dom, STATUS_PATH, token, timeout=8)
+        except Exception:  # noqa: BLE001
+            continue
+        if st in (200, 400) and isinstance(body, dict) and ("code" in body or "data" in body):
+            return dom
+    return None
+
+
+def browser_capture(cfg, accounts=None, profile_dir=None, quiet=False):
+    """从浏览器 profile 取 Token：只接受实测 200 的候选，且只替换到期的/失效的或更晚到期的。
+
+    返回 {"updated": [(label, 新到期, 域名)], "missing": [label], "scanned": n}
+    """
+    out = {"updated": [], "missing": [], "scanned": 0}
+    accounts = accounts if accounts is not None else cfg.get("accounts") or []
+    cands = browser_candidates(profile_dir)
+    out["scanned"] = len(cands)
+    if not cands:
+        return out
+    by_uid = {}
+    for c in cands:
+        by_uid.setdefault(c["uid"], []).append(c)
+    domains = list((cfg.get("settings") or {}).get("domains") or [])
+    for acc in accounts:
+        lst = by_uid.get(str(acc.get("uid") or ""))
+        if not lst:
+            out["missing"].append(acc.get("label"))
+            continue
+        cur_left = token_left_days(acc.get("token") or "")
+        cur_dom = acc.get("domain")
+        got = None
+        for c in lst:                                    # 已按 iat 倒序，先试最新的
+            dom = verify_token(c["token"], [cur_dom] + domains)
+            if dom:
+                got = (c, dom)
+                break
+        if not got:
+            out["missing"].append(acc.get("label"))
+            continue
+        c, dom = got
+        new_left = (c["exp"] - int(time.time())) / 86400.0
+        # 判断「是否该替换」的唯一依据是：现有 Token 现在还能不能用。
+        # 仍可用且活得更久 → 不降级；已被拒（401）→ 无论长短都换。
+        cur_live = verify_token(acc.get("token") or "", [cur_dom] + domains) if acc.get("token") else None
+        if cur_live and cur_left is not None and cur_left >= new_left:
+            if not quiet:
+                print("  · %s 现有 Token 仍可用且更久（剩 %.1f 天 >= %.1f 天），保持不变"
+                      % (acc.get("label"), cur_left, new_left))
+            continue
+        acc["token"] = c["token"]
+        acc["domain"] = dom
+        acc["updated_at"] = now_str()
+        acc["source"] = "browser"
+        out["updated"].append((acc.get("label"),
+                               datetime.fromtimestamp(c["exp"]).strftime("%Y-%m-%d %H:%M"), dom))
+    return out
+
+
+# ---------------- 借「WorkBuddy 积分助手」技能解密登录态（v1.0.7） ----------------
+# 2026-10-24：客户端 5.6.2+ 把登录态改成 AES-256-GCM 信封后，本工具读不到 Token。
+# 「WorkBuddy积分助手」技能（totorosir-workbuddy-score ≥3.1.0）已实现同款「读端解密」：
+#   envelope(suite=1) = {keyId, nonce, authTag, ciphertext}
+#   key    = SHA256(atRestSecretKey 字符串 UTF-8)
+#   keyId  = SHA256(key).hexdigest()[:16]
+#   atRestSecretKey 由客户端用「当前用户」DPAPI 保护 —— 只有本机本人账户能解。
+# 本工具**不复制它的代码**，而是把它当库调用（加载其 buddy_station.load_credentials），
+# 好处：① 无代码拷贝，不存在许可证问题；② 技能升级后自动跟随；③ 共用同一安全边界（只读）。
+SKILL_SCRIPT_DIRS = [
+    os.path.join(os.path.expanduser("~"), ".workbuddy", "skills",
+                 "totorosir-workbuddy-score", "scripts"),
+    os.path.join(os.path.expanduser("~"), ".workbuddy", "skills",
+                 "totorosir-workbuddy-score__skillhub", "scripts"),
+]
+
+
+def skill_module_path():
+    for d in SKILL_SCRIPT_DIRS:
+        p = os.path.join(d, "buddy_station.py")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def skill_decrypt_auth():
+    """让积分助手技能解密本机登录态，返回 (token, domain, uid) 或 None。全程只读。"""
+    path = skill_module_path()
+    if not path:
+        return None
+    dirs = auth_dirs()
+    if not dirs:
+        return None
+    info = os.path.join(dirs[0], "workbuddy-desktop.info")
+    if not os.path.isfile(info):
+        return None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_wb_score_skill", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        token, domain = mod.load_credentials(info)
+    except Exception:  # noqa: BLE001
+        return None
+    if not token:
+        return None
+    uid = ""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        uid = str(json.loads(base64.urlsafe_b64decode(
+            payload.encode("utf-8")).decode("utf-8")).get("sub") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    return token, domain, uid
+
+
+def skill_local_refresh_token():
+    """解密本机登录态里的 refreshToken（长效令牌）。只读，失败返回 None。"""
+    path = skill_module_path()
+    dirs = auth_dirs()
+    if not path or not dirs:
+        return None
+    info = os.path.join(dirs[0], "workbuddy-desktop.info")
+    if not os.path.isfile(info):
+        return None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_wb_score_skill", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with open(info, "r", encoding="utf-8") as f:
+            raw = (json.load(f).get("auth") or {}).get("refreshToken")
+        if not raw:
+            return None
+        return mod.decrypt_access_token_field(raw)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ---- 长效刷新令牌通道（v1.0.9）----
+# 客户端换账号后，原账号的短效 Token 会失效；但 refreshToken 仍可用它自己的通道续期，
+# 且**不需要客户端在线**。借此让每个账号只登录一次即可长期自动续。
+RT_PLUGIN_API = "https://copilot.tencent.com"
+RT_REFRESH_PATH = "/v2/plugin/auth/token/refresh"
+
+
+def rt_refresh(acc):
+    """用该账号的 refresh_token 换新 accessToken（并回写轮换后的 refresh_token）。
+
+    成功返回 True；无 refresh_token 或失败返回 False（保留原 Token，不报错）。
+    """
+    rt = (acc.get("refresh_token") or "").strip()
+    if not rt:
+        return False
+    req = urllib.request.Request(RT_PLUGIN_API + RT_REFRESH_PATH,
+                                 data=b"{}", method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("X-Refresh-Token", rt)
+    req.add_header("X-Auth-Refresh-Source", "plugin")
+    req.add_header("X-Domain", "copilot.tencent.com")
+    req.add_header("User-Agent", "WorkBuddy-MultiCheckin/%s" % VERSION)
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(body, dict) or body.get("code") not in (0, "0"):
+        return False
+    data = body.get("data") or {}
+    tok = data.get("accessToken") or data.get("access_token")
+    if not tok:
+        return False
+    acc["token"] = tok
+    new_rt = data.get("refreshToken") or data.get("refresh_token")
+    if new_rt:
+        acc["refresh_token"] = new_rt
+    if data.get("domain"):
+        acc["domain"] = "www.workbuddy.cn"
+    acc["updated_at"] = now_str()
+    acc["source"] = "rt"
+    return True
+
+
+def rt_capture_all(cfg, accounts, quiet=False):
+    """对所有带 refresh_token 的账号续期一次。返回更新的账号名列表。"""
+    done = []
+    for acc in accounts:
+        if not acc.get("refresh_token"):
+            continue
+        try:
+            if rt_refresh(acc):
+                done.append(acc.get("label"))
+        except Exception:  # noqa: BLE001
+            pass
+    return done
+
+
+def skill_capture(cfg, accounts=None, quiet=False):
+    """用技能解出的 Token 更新「uid 相同」的那个账号。只接受实测可用的候选。
+
+    返回 {"updated": [(label, 到期, 域名)], "missing": [...], "available": bool}
+    """
+    out = {"updated": [], "missing": [], "available": False, "rt_saved": False}
+    accounts = accounts if accounts is not None else cfg.get("accounts") or []
+    got = skill_decrypt_auth()
+    if not got:
+        return out
+    token, domain, uid = got
+    out["available"] = True
+    acc = None
+    for a in accounts:
+        if uid and str(a.get("uid") or "") == uid:
+            acc = a
+            break
+    if acc is None:
+        out["missing"].append("本机登录态账号（uid %s）不在配置里" % mask_id(uid))
+        return out
+    # 顺手把该账号的长效刷新令牌也存下来：以后不依赖客户端常驻，也能自己续期
+    rt = skill_local_refresh_token()
+    if rt and acc.get("refresh_token") != rt:
+        acc["refresh_token"] = rt
+        out["rt_saved"] = True
+    dom = verify_token(token, [domain])
+    if not dom:
+        out["missing"].append(acc.get("label"))
+        return out
+    new_left = token_left_days(token) or 0
+    cur = acc.get("token") or ""
+    cur_left = token_left_days(cur) if cur else None
+    cur_live = verify_token(cur, [acc.get("domain")] + list(
+        (cfg.get("settings") or {}).get("domains") or [])) if cur else None
+    if cur_live and cur_left is not None and cur_left >= new_left:
+        if not quiet:
+            print("  · %s 现有 Token 仍可用且更久（剩 %.1f 天 >= %.1f 天），保持不变"
+                  % (acc.get("label"), cur_left, new_left))
+        return out
+    acc["token"] = token
+    acc["domain"] = dom
+    acc["updated_at"] = now_str()
+    acc["source"] = "skill-decrypt"
+    exp = datetime.fromtimestamp(int(time.time() + new_left * 86400)).strftime("%Y-%m-%d %H:%M")
+    out["updated"].append((acc.get("label"), exp, dom))
+    return out
+
+
+def cmd_skill_capture(args):
+    cfg = load_config()
+    if not skill_module_path():
+        print("未安装「WorkBuddy积分助手」技能，无法走解密通道。")
+        print("可选：安装该技能，或改用 --browser-login / --browser-capture。")
+        return 2
+    print("技能脚本：%s" % skill_module_path())
+    r = skill_capture(cfg)
+    if not r["available"]:
+        print("解密失败：本机登录态无法解开（可能未登录，或客户端版本/账户不匹配）。")
+        return 1
+    if r["updated"]:
+        save_config(cfg)
+        for label, exp, dom in r["updated"]:
+            print("  ✓ %s 已更新（新 Token %s 到期，域名 %s，来源 skill-decrypt）"
+                  % (label, exp, dom))
+    if r["missing"]:
+        print("  ✗ %s" % "，".join(str(x) for x in r["missing"]))
+    if not r["updated"] and not r["missing"]:
+        print("已是最优 Token，无需更新。")
+    return 0
+
+
+def cmd_browser_login(args):
+    ok, info = browser_login(args.browser_profile)
+    if not ok:
+        print(info)
+        return 2
+    print("已用专属浏览器会话打开登录页：%s" % BROWSER_LOGIN_URL)
+    print("浏览器配置目录：%s" % info)
+    print()
+    print("请在该窗口里完成登录（手机号+验证码 / 扫码均可）。")
+    wait_min = int(getattr(args, "wait_login", 0) or 0)
+    if wait_min <= 0:
+        print("登录成功后回到这里运行：python wb_checkin_multi.py --browser-capture")
+        print("此浏览器窗口以后可以一直留着登录状态，不必反复登录。")
+        return 0
+
+    print("正在等待登录完成（最多 %d 分钟，每 5 秒检查一次）…" % wait_min)
+    cfg = load_config()
+    deadline = time.time() + wait_min * 60
+    hinted = False
+    while time.time() < deadline:
+        try:
+            cands = browser_candidates(info)
+        except Exception:  # noqa: BLE001
+            cands = []
+        # 登录后 40 秒仍拿不到 Token，说明该站点用 HttpOnly Cookie，早点告知别让用户干等
+        if not cands and not hinted and time.time() > deadline - wait_min * 60 + 40:
+            try:
+                started = any(os.path.isfile(os.path.join(b, f))
+                              for b, _d, fs in os.walk(info) for f in fs[:1])
+            except Exception:  # noqa: BLE001
+                started = False
+            if started:
+                hinted = True
+                print()
+                print("  提示：浏览器已经启动并写入数据，但页面里没有 Bearer Token ——")
+                print("  该站点用 HttpOnly Cookie 存登录态，页面脚本和本地存储都读不到。")
+                print("  请改走 cURL 导入：DevTools → Network → 任一 /v2 请求 →")
+                print("  右键 Copy as cURL → 存成 curl.txt → 运行 --from-curl curl.txt")
+                print("  （本窗口会继续等待，你可以直接关掉它。）")
+                print()
+        if cands:
+            r = browser_capture(cfg, profile_dir=info, quiet=True)
+            if r["updated"]:
+                save_config(cfg)
+                print()
+                for label, exp, dom in r["updated"]:
+                    print("  ✓ %s 已写入（新 Token %s 到期，域名 %s）" % (label, exp, dom))
+                if r["missing"]:
+                    print("  ✗ 仍未拿到可用 Token：%s"
+                          % "，".join(str(x) for x in r["missing"]))
+                print("\n完成。浏览器窗口可以直接关掉（登录状态会保留在专属 profile 里）。")
+                return 0
+        time.sleep(5)
+    print("\n等待超时：没有在浏览器会话里找到可用 Token。")
+    print("请确认已登录成功（能看到进入应用后的页面，而不是还停在登录页），再重新运行本命令。")
+    return 1
+
+
+# ---------------- 从 cURL / HAR 导入会话（v1.0.8） ----------------
+# 用途：网页端登录态是 HttpOnly Cookie，页面脚本与本地存储都拿不到 Bearer，
+# 但 DevTools 里「Copy as cURL」会把真实请求头完整复制出来（含 Authorization）。
+# 这是官方工具链建议的兜底方式，一次粘贴即可，无需任何解密。
+_CURL_HDR_RE = re.compile(r"""(?:-H|--header)\s+(['"])(.*?)\1""", re.S)
+
+
+def parse_curl(text):
+    """从 cURL 文本里提取 (token, cookie, host)。找不到的项为 None。"""
+    token = cookie = host = None
+    for m in _CURL_HDR_RE.finditer(text or ""):
+        raw = m.group(2).strip()
+        if ":" not in raw:
+            continue
+        name, value = raw.split(":", 1)
+        name = name.strip().lower()
+        value = value.strip()
+        if name == "authorization" and value.lower().startswith("bearer "):
+            token = value[7:].strip()
+        elif name == "cookie":
+            cookie = value
+    mh = re.search(r"https://([a-z0-9.-]+)/", text or "", re.I)
+    if mh:
+        host = mh.group(1)
+    return token, cookie, host
+
+
+def cmd_from_curl(args):
+    path = args.from_curl
+    text = ""
+    if path and os.path.isfile(path):
+        text = open(path, "r", encoding="utf-8", errors="replace").read()
+    elif path:
+        print("找不到文件：%s" % path)
+        return 2
+    else:
+        print("把浏览器 DevTools 里「Copy as cURL」的内容粘贴到下面，结束请按 Ctrl+Z 回车：")
+        try:
+            text = sys.stdin.read()
+        except Exception:  # noqa: BLE001
+            text = ""
+    token, cookie, host = parse_curl(text)
+    print("解析结果：Authorization=%s  Cookie=%s  域名=%s"
+          % ("有 Bearer" if token else "无", "有" if cookie else "无", host or "未识别"))
+    if not token:
+        if cookie:
+            print("该请求只有 Cookie、没有 Bearer —— 无法直接使用（Cookie 会话格式为浏览器私有）。")
+            print("请在 DevTools 里换一个带 Authorization 请求头的 /v2 请求再复制 cURL。")
+        else:
+            print("没有从这个 cURL 里找到 Authorization: Bearer，请确认复制的是 API 请求（XHR/Fetch）。")
+        return 1
+    dom = verify_token(token, [host] if host else None)
+    if not dom:
+        print("该 Token 实测不可用（接口未返回 200），不写入配置。")
+        return 1
+    uid = ""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        uid = str(json.loads(base64.urlsafe_b64decode(
+            payload.encode("utf-8")).decode("utf-8")).get("sub") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    cfg = load_config()
+    acc = None
+    for a in cfg["accounts"]:
+        if uid and str(a.get("uid") or "") == uid:
+            acc = a
+            break
+    if acc is None:
+        print("该 Token 属于 uid %s，配置里没有这个账号。" % mask_id(uid))
+        print("可先用 --add --label 名字 --token <Token> 添加。")
+        return 1
+    acc["token"] = token
+    acc["domain"] = dom
+    acc["updated_at"] = now_str()
+    acc["source"] = "curl"
+    save_config(cfg)
+    print("  ✓ 已更新 %s（域名 %s，剩余 %s）"
+          % (acc.get("label"), dom, fmt_duration(int((token_left_days(token) or 0) * 86400))))
+    return 0
+
+
+def cmd_rt_refresh(args):
+    """手动用长效令牌给所有账号续期一次，并报告每个账号的结果。"""
+    cfg = load_config()
+    accs = [a for a in cfg["accounts"] if a.get("enabled", True)]
+    if not any(a.get("refresh_token") for a in accs):
+        print("没有任何账号存有长效刷新令牌。")
+        print("在本机客户端登录该账号后运行 --skill-capture 即可自动存下。")
+        return 2
+    changed = 0
+    for a in accs:
+        if not a.get("refresh_token"):
+            print("  · %s 无长效令牌，跳过" % a.get("label"))
+            continue
+        before = token_left_days(a.get("token") or "")
+        if rt_refresh(a):
+            changed += 1
+            after = token_left_days(a.get("token") or "")
+            print("  ✓ %s 已续期：剩 %.1f 天 → %.1f 天"
+                  % (a.get("label"), before or 0, after or 0))
+        else:
+            print("  ✗ %s 续期失败：长效令牌可能已失效，需重新登录客户端后再 --skill-capture"
+                  % a.get("label"))
+    if changed:
+        save_config(cfg)
+    return 0 if changed else 1
+
+
+def cmd_from_netlog(args):
+    """从 Edge/Chrome 的 netlog 里提取 Bearer Token（--log-net-log 产出）。
+
+    原理：浏览器用 --net-log-capture-mode=IncludeSensitive 启动时，会把请求头
+    （含 Authorization: Bearer …）明文写进 netlog。我们只做全文正则 + 逐个实测，
+    不依赖页面存储，也不需要 DevTools。
+    """
+    path = args.from_netlog
+    if not path or not os.path.isfile(path):
+        print("找不到 netlog 文件：%s" % path)
+        return 2
+    size = os.path.getsize(path)
+    print("读取 netlog：%s（%.1f MB）" % (path, size / 1048576.0))
+    try:
+        raw = open(path, "rb").read()
+    except Exception as e:  # noqa: BLE001
+        print("读取失败：%s" % e)
+        return 2
+    found = {}
+    for m in _JWT_RE.findall(raw):
+        tok = m.decode("ascii", "ignore")
+        try:
+            payload = tok.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            d = json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")).decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        iss = str(d.get("iss") or "")
+        if "copilot.tencent.com" not in iss and "workbuddy" not in iss:
+            continue
+        uid = str(d.get("sub") or "")
+        iat = int(d.get("iat") or 0)
+        if not uid or iat <= 0:
+            continue
+        key = (uid, iat)
+        if key not in found:
+            found[key] = {"uid": uid, "token": tok, "iat": iat, "exp": int(d.get("exp") or 0)}
+    print("去重后候选 Token：%d 条" % len(found))
+    if not found:
+        print("netlog 里没有找到 Bearer Token。可能原因：")
+        print("  ① 页面还没加载完就抓了；② 启动参数没带 --net-log-capture-mode=IncludeSensitive。")
+        return 1
+    cfg = load_config()
+    best = {}
+    for c in sorted(found.values(), key=lambda x: -x["iat"]):
+        dom = verify_token(c["token"], None)
+        print("  uid=%s iat=%s 实测=%s"
+              % (mask_id(c["uid"]),
+                 datetime.fromtimestamp(c["iat"]).strftime("%m-%d %H:%M"),
+                 ("✅ " + dom) if dom else "不可用"))
+        if dom and c["uid"] not in best:
+            best[c["uid"]] = (c, dom)
+    if not best:
+        print("候选全部不可用（可能都已过期或被吊销）。")
+        return 1
+    changed = 0
+    for uid, (c, dom) in best.items():
+        acc = next((a for a in cfg["accounts"] if str(a.get("uid") or "") == uid), None)
+        if acc is None:
+            print("  该 Token 属于 uid %s，配置里没有这个账号（可用 --add 添加）" % mask_id(uid))
+            continue
+        acc["token"] = c["token"]
+        acc["domain"] = dom
+        acc["updated_at"] = now_str()
+        acc["source"] = "netlog"
+        changed += 1
+        print("  ✓ 已更新 %s（域名 %s，到期 %s）"
+              % (acc.get("label"), dom,
+                 datetime.fromtimestamp(c["exp"]).strftime("%Y-%m-%d %H:%M")))
+    if changed:
+        save_config(cfg)
+    return 0 if changed else 1
+
+
+def cmd_browser_capture(args):
+    cfg = load_config()
+    prof = args.browser_profile or BROWSER_PROFILE_DIR
+    dirs = browser_profile_dirs(prof)
+    if not dirs:
+        print("还没有浏览器会话：%s" % prof)
+        print("请先双击「登录并取Token.bat」（或运行 --browser-login）并完成登录。")
+        return 2
+    print("扫描浏览器会话：%s" % "，".join(os.path.basename(d) for d in dirs))
+    r = browser_capture(cfg, profile_dir=prof)
+    print("提取到候选 Token %d 条。" % r["scanned"])
+    if r["scanned"] == 0:
+        print("该浏览器会话里没有找到 Bearer Token。")
+        print("原因已查明（2026-10-24）：网页端把登录态放在 **HttpOnly Cookie** 里，")
+        print("页面脚本与本地存储都读不到，因此扫 profile 这条路对该站点无效。")
+        print("改用：DevTools → Network → 任一 /v2 请求 → 右键 Copy as cURL → 存成 curl.txt，")
+        print("然后运行  python wb_checkin_multi.py --from-curl curl.txt")
+        return 1
+    if r["updated"]:
+        save_config(cfg)
+        for label, exp, dom in r["updated"]:
+            print("  ✓ %s 已更新（新 Token %s 到期，域名 %s）" % (label, exp, dom))
+    if r["missing"]:
+        print("  ✗ 以下账号没拿到可用 Token：%s" % "，".join(str(x) for x in r["missing"]))
+        print("    可能原因：① 该账号未在浏览器里登录过；② 浏览器里的登录已过期。")
+    if not r["updated"] and not r["missing"]:
+        print("配置里的账号都已是最优 Token，无需更新。")
+    return 0 if r["updated"] or not r["missing"] else 1
 
 
 # ---------------- 配置读写 ----------------
@@ -1222,7 +1885,14 @@ def run_one(acc, settings, do_check=True, check_only=False, travel_mode="auto",
     if do_check:
         base, domain, err = resolve_base(acc, settings.get("domains"))
         if not base:
-            res["msg"] = "无法连接签到接口（所有候选域名均失败：%s）" % err
+            # 401/403 不是网络问题：Token 未到期也会被服务端吊销，必须说清楚，否则会误判成域名/网络故障
+            if "401" in str(err) or "403" in str(err):
+                res.update(action="token_revoked",
+                           msg="凭证已失效（%s，非网络问题）：Token 未到期但被服务端拒绝，"
+                               "需重新获取 → --skill-capture（本机已登录）或 --browser-capture（网页会话）"
+                               % err)
+            else:
+                res["msg"] = "无法连接签到接口（所有候选域名均失败：%s）" % err
             return res
         res["domain"] = domain
 
@@ -1367,10 +2037,26 @@ def scan_auth_files(extra_dir=None):
 
 def cmd_capture(args):
     cfg = load_config()
+    # v1.0.7：优先走「积分助手」技能解密（客户端 5.6.2+ 的登录态是加密信封，明文快照已不可靠）
+    # 重要：技能通道一旦可用即视为**权威来源**，绝不再用明文快照覆盖
+    #      —— 明文快照都是加密改造前的旧 Token，早已被服务端吊销，覆盖等于自毁。
+    if skill_module_path():
+        sr = skill_capture(cfg)
+        if sr.get("updated"):
+            save_config(cfg)
+            print("已通过技能解密更新 %d 个账号：" % len(sr["updated"]))
+            for label, exp, dom in sr["updated"]:
+                print("  ✓ %s（新 Token %s 到期，域名 %s）" % (label, exp, dom))
+        if sr.get("available"):
+            if sr.get("missing"):
+                print("  注意：%s" % "；".join(str(x) for x in sr["missing"]))
+            print("技能通道可用，已跳过明文快照扫描（旧快照的 Token 均已被服务端吊销）。")
+            return 0
+        print("技能解密不可用，回退到明文快照扫描。")
     found, stats = scan_auth_files(args.capture_dir)
     if not found:
         print("未发现任何可用的明文 Token（本机登录态可能已全部被本地加密，或客户端从未登录过）。")
-        print("可用 --add 手工添加，或 --capture-dir 指定目录。")
+        print("可用 --skill-capture（本机已登录，推荐）、--browser-capture（网页会话），或 --add 手工添加。")
         print("扫描目录：%s" % "，".join(stats["dirs"]))
         return 2
     print("扫描 %d 个登录态文件：明文 %d / 加密 %d / 已过期 %d / 损坏 %d"
@@ -1379,6 +2065,12 @@ def cmd_capture(args):
     for rec in sorted(found, key=lambda r: r["mtime"], reverse=True):
         if not rec["valid"]:
             print("  ✗ 跳过已过期账号 %s（%s 到期）" % (mask_id(rec["uid"]), rec["exp_str"]))
+            continue
+        # 实测验证：exp 未到 ≠ 可用（2026-10-24 教训：旧快照全被服务端吊销，写入即自毁）
+        if not verify_token(rec["token"], [rec["domain"]] + list(
+                (cfg.get("settings") or {}).get("domains") or [])):
+            print("  ✗ 跳过 %s：该快照的 Token 被服务端拒绝，不可用（保留现有配置）"
+                  % mask_id(rec["uid"]))
             continue
         label = rec["label"]
         if args.label_prefix:
@@ -1452,7 +2144,7 @@ def cmd_list(args):
         return 0
     print("%s %s %s %s %s %s"
           % (pad("id", 6), pad("账号名", 18), pad("uid", 11), pad("域名", 23),
-             pad("启用", 6), "Token 状态"))
+             pad("启用", 6), "Token 到期（本地时钟，未校验服务端）"))
     print("-" * 92)
     for acc in accounts:
         ok, left, exp_str = token_status(clean_token(acc.get("token")))
@@ -1594,6 +2286,29 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
     if not greet_model:
         greet_model = settings.get("greet_model") or GREET_DEFAULT_MODEL
 
+    # v1.0.7：先用「积分助手」技能解密本机登录态，取客户端当前最新 Token
+    #（客户端 5.6.2+ 把 Token 加密后，这是唯一能拿到「最新且未被吊销」Token 的通道）
+    try:
+        sc = skill_capture(cfg, accounts, quiet=as_json)
+    except Exception:  # noqa: BLE001
+        sc = {"updated": []}
+    if sc.get("updated") or sc.get("rt_saved"):
+        save_config(cfg)
+        if not as_json:
+            for label, exp, dom in sc["updated"]:
+                print("Token 解密更新：%s（新 Token %s 到期，域名 %s，来源 skill-decrypt）"
+                      % (label, exp, dom))
+
+    # v1.0.9：带长效刷新令牌的账号，每次运行前先换一次新 Token（不依赖客户端在线）
+    try:
+        rt_done = rt_capture_all(cfg, accounts)
+    except Exception:  # noqa: BLE001
+        rt_done = []
+    if rt_done:
+        save_config(cfg)
+        if not as_json:
+            print("长效令牌续期：%s" % "，".join(str(x) for x in rt_done))
+
     # v1.0.5：运行前自动为「已过期 / 临期」账号续期（settings.token_auto_refresh 可关）
     if bool(settings.get("token_auto_refresh", True)):
         try:
@@ -1676,7 +2391,7 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
                 print("⚠ Token 已过期：%s" % "，".join(l for l, _ in dead))
             if soon:
                 print("⚠ Token 临期：%s" % "，".join(
-                    "%s 剩 %d 天" % (l, max(1, int(d))) for l, d in soon))
+                    "%s 剩 %d 天" % (l, max(1, int(round(d)))) for l, d in soon))
             print("  处理：登录该账号后运行 --capture（菜单 8 → 1）刷新；"
                   "每次运行前也会自动尝试从本机登录态续期。")
         print("日志：%s" % LOG_DIR)
@@ -1735,9 +2450,9 @@ def execute_run(cfg, accounts, do_check=True, check_only=False, travel_mode="aut
                 near = sorted(soon, key=lambda x: x[1])[0]
                 if not dead:
                     title = "WorkBuddy 凭证临期：%s 的 Token 剩 %d 天" % (
-                        near[0], max(1, int(near[1])))
+                        near[0], max(1, int(round(near[1]))))
                 body += " ｜ ⚠ Token 临期：%s（--capture 可续期）" % "，".join(
-                    "%s 剩 %d 天" % (l, max(1, int(d))) for l, d in soon)
+                    "%s 剩 %d 天" % (l, max(1, int(round(d)))) for l, d in soon)
         desktop_toast(title, body)
 
     return results, elapsed, (0 if all(r["status"] == "ok" for r in results) else 1)
@@ -2167,7 +2882,24 @@ def build_parser():
                "  python wb_checkin_multi.py --greet-status     # 看今天问候发了没\n"
                "  python wb_checkin_multi.py --greet-window     # 计划任务入口（每15分钟轮询）\n"
                "  python wb_checkin_multi.py --no-greet         # 今天不发问候（纯签到）\n")
-    p.add_argument("--capture", action="store_true", help="从本机历史登录态提取 Token 写入配置")
+    p.add_argument("--capture", action="store_true",
+                   help="从本机历史登录态提取 Token 写入配置（仅对旧的明文快照有效）")
+    p.add_argument("--from-netlog", dest="from_netlog", metavar="文件",
+                   help="从 Edge/Chrome 的 --log-net-log 文件里提取 Bearer Token")
+    p.add_argument("--from-curl", dest="from_curl", metavar="文件",
+                   help="从 DevTools「Copy as cURL」的内容导入 Token（省略路径则交互粘贴）")
+    p.add_argument("--rt-refresh", action="store_true", dest="rt_refresh",
+                   help="用各账号的长效刷新令牌续期一次（不依赖客户端在线）")
+    p.add_argument("--skill-capture", action="store_true", dest="skill_capture",
+                   help="用「WorkBuddy积分助手」技能解密本机登录态取 Token（v1.0.7，推荐）")
+    p.add_argument("--browser-login", action="store_true", dest="browser_login",
+                   help="用专属浏览器会话打开登录页（v1.0.6，一次性人工登录）")
+    p.add_argument("--browser-capture", action="store_true", dest="browser_capture",
+                   help="从该浏览器会话里提取可用 Token 写入配置（实测 200 才接受）")
+    p.add_argument("--browser-profile", dest="browser_profile",
+                   help="自定义浏览器配置目录（默认 .browser-profile）")
+    p.add_argument("--wait-login", dest="wait_login", type=int, metavar="分钟",
+                   help="配合 --browser-login：启动后轮询等待登录完成（默认不等待）")
     p.add_argument("--capture-dir", help="自定义登录态目录（配合 --capture）")
     p.add_argument("--label-prefix", help="capture 时给账号名加统一前缀，如 公司")
     p.add_argument("--keep-label", action="store_true",
@@ -2225,6 +2957,18 @@ def main():
         import wb_menu  # 延迟导入，避免与菜单模块形成循环依赖
         return wb_menu.main()
 
+    if args.rt_refresh:
+        return cmd_rt_refresh(args)
+    if args.from_netlog is not None:
+        return cmd_from_netlog(args)
+    if args.from_curl is not None:
+        return cmd_from_curl(args)
+    if args.skill_capture:
+        return cmd_skill_capture(args)
+    if args.browser_login:
+        return cmd_browser_login(args)
+    if args.browser_capture:
+        return cmd_browser_capture(args)
     if args.capture:
         return cmd_capture(args)
     if args.add:

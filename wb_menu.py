@@ -305,6 +305,32 @@ def act_run_selected():
 
 
 # --- 账号管理 ---
+def act_skill_capture():
+    print()
+    print(C.w("  用「WorkBuddy积分助手」技能解密本机登录态（客户端 5.6.2+ 加密后唯一可用的本机通道）…", C.DIM))
+    print()
+    if not core.skill_module_path():
+        print(C.w("  未安装该技能，无法使用本通道。", C.YELLOW))
+        print(C.w("  替代方案：「8 → 1」明文快照（多半已失效）或「8 → 7」网页会话授权。", C.DIM))
+        return
+    code = core.cmd_skill_capture(argparse.Namespace())
+    if code == 0:
+        print(C.w("\n  提示：该文件含明文 Token，请勿外传。", C.YELLOW))
+
+
+def act_browser_login():
+    print()
+    print(C.w("  打开一个独立浏览器会话（与日常浏览器互不影响），登录后自动提取 Token。", C.DIM))
+    print(C.w("  适合：该账号不在本机客户端登录、但你能用手机号/扫码登录网页版。", C.DIM))
+    print()
+    if not core.browser_exe():
+        print(C.w("  未找到 Edge / Chrome，无法使用本通道。", C.YELLOW))
+        return
+    code = core.cmd_browser_login(argparse.Namespace(browser_profile=None, wait_login=10))
+    if code == 0:
+        core.cmd_browser_capture(argparse.Namespace(browser_profile=None))
+
+
 def act_capture():
     print()
     print(C.w("  从本机 WorkBuddy 登录态文件中提取 Token（只读，按账号归组）…", C.DIM))
@@ -773,12 +799,15 @@ def menu(title, items, back_key="0", back_label="返回上级"):
 def main():
     setup_console()
     sub_accounts = submenu("账号管理", [
-        ("1", "从本机登录态提取 Token（批量，推荐）", act_capture),
+        ("1", "从本机登录态提取 Token（批量，优先走技能解密）", act_capture),
         ("2", "手工添加账号", act_add_account),
         ("3", "更新某个账号的 Token", act_set_token),
         ("4", "启用 / 停用账号", act_toggle_account),
         ("5", "删除账号", act_remove_account),
         ("6", "查看账号列表", lambda: print_accounts()),
+        ("7", "仅供诊断：技能解密取 Token（不经明文快照）", act_skill_capture),
+        ("8", "网页会话登录取 Token（备用，需浏览器登录一次）", act_browser_login),
+        ("9", "长效令牌续期一次（不依赖客户端在线）", lambda: core.cmd_rt_refresh(argparse.Namespace())),
     ])
     sub_greet = submenu("每日问候（6 种语言 × 随机时刻）", [
         ("1", "立即强制发一条（忽略窗口与「当天已发」）", act_greet_force),

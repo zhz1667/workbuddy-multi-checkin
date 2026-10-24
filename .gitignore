@@ -44,3 +44,11 @@ accounts.json.bak*
 
 # WorkBuddy 项目数据（会话记忆 / 自动化记录），不随仓库发布
 .workbuddy/
+
+# 浏览器会话目录（含登录 Cookie / localStorage，等同凭据）
+.browser-profile/
+
+# 过程产物：netlog 含请求头与 Cookie，curl.txt 含 Authorization，均是凭据
+netlog.json
+netlog*.json
+curl.txt
