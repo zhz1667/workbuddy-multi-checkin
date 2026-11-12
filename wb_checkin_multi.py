@@ -140,7 +140,7 @@ if sys.version_info < (3, 6):
     sys.stderr.write("需要 Python 3.6+，当前 %s\n" % sys.version.split()[0])
     sys.exit(2)
 
-VERSION = "1.0.10"
+VERSION = "1.0.11"
 
 # ---------------- 路径与常量 ----------------
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1382,13 +1382,8 @@ def do_checkin(acc, base, check_only=False):
 
 # ---------------- 派小猫旅行 ----------------
 def travel_get(token, path):
-    try:
-        st, body = api_call(TRAVEL_BASE, path, token, method="GET")
-        if st == 200 and isinstance(body, dict) and body.get("code") == 0:
-            return body.get("data")
-    except Exception:  # noqa: BLE001
-        return None
-    return None
+    """只读 GET（带重试）；成功返回 data，否则 None。"""
+    return _read_retry(TRAVEL_BASE, path, token)[0]
 
 
 def travel_claim(token):
@@ -1428,9 +1423,10 @@ def travel_auto(token, location_id=None, read_only=False):
     """派小猫闭环：先领取、后派遣。派遣前必查 daily_limit_reached。"""
     out = {"available": False, "state": None, "state_text": None, "location_name": None,
            "remaining_text": None, "reward_credit": None, "auto_log": []}
-    status = travel_get(token, TRAVEL_STATUS_PATH)
+    status, err = _read_retry(TRAVEL_BASE, TRAVEL_STATUS_PATH, token)
     if status is None:
-        out["auto_log"].append("查询旅行状态失败（接口不可用或 Token 失效），已跳过")
+        out["auto_log"].append("查询旅行状态失败（%s），已重试 %d 次仍不通，本次跳过"
+                               % (err, len(READ_RETRY_WAITS)))
         return out
     out["available"] = True
 
@@ -1484,14 +1480,34 @@ def _score_band(score):
 
 def growth_get(token, path):
     """只读 GET 成长计划接口；成功返回 data 字典，否则 None。"""
-    try:
-        st, body = api_call(GROWTH_BASE, path, token, method="GET")
-    except Exception:  # noqa: BLE001
-        return None
-    if st == 200 and isinstance(body, dict) and str(body.get("code")) == "0":
-        data = body.get("data")
-        return data if isinstance(data, dict) else None
-    return None
+    return _read_retry(GROWTH_BASE, path, token)[0]
+
+
+# ---------------- 只读接口重试（v1.0.11） ----------------
+# 2026-11-12 事故：09:00 那次定时任务里「小猫旅行状态」「活跃地图」同时查询失败，
+# 但两分钟后再跑完全正常 —— 属瞬时抖动。旧实现每个只读接口只打一次、失败即放弃，
+# 且把真实原因（HTTP 状态 / 异常）吞掉，报告只会说「接口不可用或 Token 失效」，无法判断。
+READ_RETRY_WAITS = (0, 1.5, 3.0)      # 每次尝试前的等待秒数，长度即尝试次数
+
+
+def _read_retry(base, path, token, waits=READ_RETRY_WAITS):
+    """只读 GET，带退避重试。返回 (data, err)：成功时 err 为 None。"""
+    last = "未知错误"
+    for i, wait in enumerate(waits):
+        if wait:
+            time.sleep(wait)
+        try:
+            st, body = api_call(base, path, token, method="GET")
+        except Exception as e:  # noqa: BLE001
+            last = "%s: %s" % (type(e).__name__, str(e)[:60])
+            continue
+        code = body.get("code") if isinstance(body, dict) else None
+        if st == 200 and isinstance(body, dict) and str(code) == "0":
+            return body.get("data"), None
+        last = "HTTP %s" % st
+        if code not in (None, 0, "0"):
+            last += " code=%s" % code
+    return None, last
 
 
 def _parse_iso_dt(s):
@@ -1543,8 +1559,10 @@ def check_activity(token):
 
     now = datetime.now()
     hm, best_age, reads = None, None, 0
+    last_err = "未知错误"
     for attempt in range(ACTIVITY_RETRY_TIMES + 1):
-        cand = growth_get(token, GROWTH_HEATMAP_PATH)
+        # 这里的重读是为了「拿新鲜快照」，故每次只打一拍（wait=(0,)），由外层控制间隔
+        cand, gerr = _read_retry(GROWTH_BASE, GROWTH_HEATMAP_PATH, token, waits=(0,))
         if cand is not None:
             reads += 1
             age = _snapshot_age_min(cand.get("updated_at"), now)
@@ -1552,6 +1570,8 @@ def check_activity(token):
                 hm, best_age = cand, age
             if age is not None and age < ACTIVITY_STALE_MINUTES:
                 break                            # 拿到新鲜快照，不必再读
+        else:
+            last_err = gerr
         if attempt < ACTIVITY_RETRY_TIMES:
             time.sleep(ACTIVITY_RETRY_WAIT)
     out["heatmap_reads"] = reads
@@ -1559,7 +1579,8 @@ def check_activity(token):
                             and best_age < ACTIVITY_STALE_MINUTES)
 
     if hm is None:
-        out["msg"] = "活跃地图接口不可用（Token 失效或网络异常）"
+        out["msg"] = "活跃地图接口不可用（%s，已试 %d 次）" % (
+            last_err, ACTIVITY_RETRY_TIMES + 1)
         return out
 
     today = hm.get("today") if isinstance(hm.get("today"), dict) else {}
