@@ -88,19 +88,25 @@ $settings = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
-    -MultipleInstances IgnoreNew
+    -MultipleInstances IgnoreNew `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 5)
 
 $installed = @()
 
-# 3) 签到任务（每日固定时间跑完整流程）
+# 3) 签到任务（每日固定时间跑完整流程 + 2 小时后兜底一次）
 if (-not $OnlyGreet) {
     $t = [datetime]::ParseExact($Time, "HH:mm", $null)
     $action = New-ScheduledTaskAction -Execute $PythonPath `
         -Argument "`"$target`"" -WorkingDirectory $scriptDir
     $trigger = New-ScheduledTaskTrigger -Daily -At $t
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+    # 兜底触发：主时间点若被强制终止（如控制台被关 → 0xC000013A）或机器休眠错过，
+    # 两小时后再跑一次。脚本幂等，已签到会 2 秒内退出，无副作用。
+    $fallback = New-ScheduledTaskTrigger -Daily -At $t.AddHours(2)
+    Register-ScheduledTask -TaskName $TaskName -Action $action `
+        -Trigger @($trigger, $fallback) `
         -Settings $settings -Force | Out-Null
-    Write-Host "[2/4] 已注册签到任务：$TaskName（每日 $($t.ToString('HH:mm')))"
+    Write-Host "[2/4] 已注册签到任务：$TaskName（每日 $($t.ToString('HH:mm'))，兜底 $($t.AddHours(2).ToString('HH:mm')))"
     $installed += $TaskName
 } else {
     Write-Host "[2/4] 已跳过签到任务（-OnlyGreet）"
